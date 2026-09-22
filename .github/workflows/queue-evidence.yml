@@ -38,7 +38,7 @@ jobs:
           import json
           h=json.load(open('evidence/health.json'))
           q=json.load(open('evidence/queue-status.json'))
-          ok = h.get('ok') is True and h.get('version') == '0.14.1' and q.get('ok') is True and q.get('version') == '0.14.1'
+          ok = h.get('ok') is True and h.get('version') == '0.15.0' and q.get('ok') is True and q.get('version') == '0.15.0'
           raise SystemExit(0 if ok else 1)
           PY
             then
