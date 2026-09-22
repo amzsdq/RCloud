@@ -272,7 +272,7 @@ async function fetchFreshMailbox() {
   if (apiResponse.ok) {
     const envelope = await apiResponse.json();
     if (typeof envelope?.content === "string" && envelope.content) {
-      const compact = envelope.content.replace(/\\s/g, "");
+      const compact = envelope.content.replace(/\s/g, "");
       const bytes = Uint8Array.from(atob(compact), ch => ch.charCodeAt(0));
       return {
         command: JSON.parse(new TextDecoder().decode(bytes)),
