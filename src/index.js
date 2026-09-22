@@ -1,373 +1,152 @@
 import { DurableObject } from "cloudflare:workers";
 
+const clampSeconds = (value, fallback = 120) =>
+  Math.max(5, Math.min(Number(value) || fallback, 3600));
+
 export class RuntimeState extends DurableObject {
-  constructor(ctx, env) {
-    super(ctx, env);
-  }
+  constructor(ctx, env) { super(ctx, env); }
 
   async getState() {
-    return (await this.ctx.storage.get("state")) ?? {
-      value: "UNINITIALIZED",
-      updated_at: null
-    };
+    return (await this.ctx.storage.get("state")) ?? { value: "UNINITIALIZED", updated_at: null };
   }
 
   async setState(value) {
-    const state = {
-      value,
-      updated_at: new Date().toISOString()
-    };
-
+    const state = { value, updated_at: new Date().toISOString() };
     await this.ctx.storage.put("state", state);
     return state;
   }
 
   async armAlarm(seconds = 120) {
-    const safeSeconds = Math.max(5, Math.min(Number(seconds) || 120, 3600));
+    const safeSeconds = clampSeconds(seconds);
     const fireAt = Date.now() + safeSeconds * 1000;
-
     await this.ctx.storage.setAlarm(fireAt);
-
     const state = {
-      value: "ALARM_ARMED",
-      updated_at: new Date().toISOString(),
-      alarm_fire_at: new Date(fireAt).toISOString(),
-      alarm_interval_seconds: safeSeconds,
+      value: "ALARM_ARMED", updated_at: new Date().toISOString(),
+      alarm_fire_at: new Date(fireAt).toISOString(), alarm_interval_seconds: safeSeconds,
       loop_enabled: false
     };
-
     await this.ctx.storage.put("state", state);
-
-    return {
-      state,
-      alarm_time_ms: fireAt
-    };
+    return { state, alarm_time_ms: fireAt };
   }
 
   async startLoop(seconds = 120) {
-    const safeSeconds = Math.max(5, Math.min(Number(seconds) || 120, 3600));
+    const safeSeconds = clampSeconds(seconds);
     const fireAt = Date.now() + safeSeconds * 1000;
-
     await this.ctx.storage.put("autoboot_enabled", true);
-    await this.ctx.storage.put("loop_config", {
-      enabled: true,
-      interval_seconds: safeSeconds
-    });
-
+    await this.ctx.storage.put("loop_config", { enabled: true, interval_seconds: safeSeconds });
     await this.ctx.storage.put("loop_count", 0);
+    await this.ctx.storage.put("loop_evidence", []);
     await this.ctx.storage.setAlarm(fireAt);
-
     const state = {
-      value: "LOOP_ARMED",
-      updated_at: new Date().toISOString(),
-      alarm_fire_at: new Date(fireAt).toISOString(),
-      alarm_interval_seconds: safeSeconds,
-      loop_enabled: true,
-      loop_count: 0,
-      autoboot_enabled: true
+      value: "LOOP_ARMED", updated_at: new Date().toISOString(),
+      alarm_fire_at: new Date(fireAt).toISOString(), alarm_interval_seconds: safeSeconds,
+      loop_enabled: true, loop_count: 0, autoboot_enabled: true
     };
-
     await this.ctx.storage.put("state", state);
-
-    return {
-      state,
-      alarm_time_ms: fireAt
-    };
+    return { state, alarm_time_ms: fireAt };
   }
 
   async ensureLoop(seconds = 120) {
     const autoboot = await this.ctx.storage.get("autoboot_enabled");
-
-    if (autoboot === false) {
-      return {
-        ok: true,
-        action: "DISABLED",
-        reason: "AUTOBOOT_DISABLED"
-      };
-    }
-
-    const safeSeconds = Math.max(5, Math.min(Number(seconds) || 120, 3600));
-    const config =
-      (await this.ctx.storage.get("loop_config")) ?? {
-        enabled: false,
-        interval_seconds: safeSeconds
-      };
+    if (autoboot === false) return { ok: true, action: "DISABLED", reason: "AUTOBOOT_DISABLED" };
+    const safeSeconds = clampSeconds(seconds);
+    const config = (await this.ctx.storage.get("loop_config")) ?? { enabled: false, interval_seconds: safeSeconds };
     const alarmTime = await this.ctx.storage.getAlarm();
-    const count =
-      (await this.ctx.storage.get("loop_count")) ?? 0;
-
+    const count = (await this.ctx.storage.get("loop_count")) ?? 0;
     if (config.enabled && alarmTime != null) {
-      return {
-        ok: true,
-        action: "ALREADY_RUNNING",
-        loop_count: count,
-        alarm_time_ms: alarmTime,
-        alarm_fire_at: new Date(alarmTime).toISOString()
-      };
+      return { ok: true, action: "ALREADY_RUNNING", loop_count: count, alarm_time_ms: alarmTime, alarm_fire_at: new Date(alarmTime).toISOString() };
     }
-
-    const interval =
-      config.enabled && config.interval_seconds
-        ? Number(config.interval_seconds)
-        : safeSeconds;
-
+    const interval = config.enabled && config.interval_seconds ? Number(config.interval_seconds) : safeSeconds;
     const fireAt = Date.now() + interval * 1000;
-
     await this.ctx.storage.put("autoboot_enabled", true);
-    await this.ctx.storage.put("loop_config", {
-      enabled: true,
-      interval_seconds: interval
-    });
+    await this.ctx.storage.put("loop_config", { enabled: true, interval_seconds: interval });
     await this.ctx.storage.setAlarm(fireAt);
-
-    const previous =
-      (await this.ctx.storage.get("state")) ?? {};
-
+    const previous = (await this.ctx.storage.get("state")) ?? {};
     const state = {
-      ...previous,
-      value: "LOOP_ARMED",
-      updated_at: new Date().toISOString(),
-      alarm_fire_at: new Date(fireAt).toISOString(),
-      alarm_interval_seconds: interval,
-      loop_enabled: true,
-      loop_count: count,
-      autoboot_enabled: true,
-      bootstrapped_by: "CLOUD_CRON"
+      ...previous, value: "LOOP_ARMED", updated_at: new Date().toISOString(),
+      alarm_fire_at: new Date(fireAt).toISOString(), alarm_interval_seconds: interval,
+      loop_enabled: true, loop_count: count, autoboot_enabled: true, bootstrapped_by: "CLOUD_CRON"
     };
-
     await this.ctx.storage.put("state", state);
-
-    return {
-      ok: true,
-      action: "BOOTSTRAPPED",
-      state,
-      alarm_time_ms: fireAt
-    };
+    return { ok: true, action: "BOOTSTRAPPED", state, alarm_time_ms: fireAt };
   }
 
   async stopLoop() {
     await this.ctx.storage.put("autoboot_enabled", false);
-    await this.ctx.storage.put("loop_config", {
-      enabled: false,
-      interval_seconds: null
-    });
-
+    await this.ctx.storage.put("loop_config", { enabled: false, interval_seconds: null });
     await this.ctx.storage.deleteAlarm();
-
-    const previous =
-      (await this.ctx.storage.get("state")) ?? {};
-
-    const state = {
-      ...previous,
-      value: "LOOP_STOPPED",
-      updated_at: new Date().toISOString(),
-      loop_enabled: false,
-      autoboot_enabled: false,
-      alarm_fire_at: null
-    };
-
+    const previous = (await this.ctx.storage.get("state")) ?? {};
+    const state = { ...previous, value: "LOOP_STOPPED", updated_at: new Date().toISOString(), loop_enabled: false, autoboot_enabled: false, alarm_fire_at: null };
     await this.ctx.storage.put("state", state);
-
     return state;
   }
 
   async getLoopStatus() {
     const state = await this.getState();
-    const config =
-      (await this.ctx.storage.get("loop_config")) ?? {
-        enabled: false,
-        interval_seconds: null
-      };
+    const config = (await this.ctx.storage.get("loop_config")) ?? { enabled: false, interval_seconds: null };
     const alarmTime = await this.ctx.storage.getAlarm();
-    const count =
-      (await this.ctx.storage.get("loop_count")) ?? 0;
-    const autoboot =
-      (await this.ctx.storage.get("autoboot_enabled")) !== false;
-
+    const count = (await this.ctx.storage.get("loop_count")) ?? 0;
+    const evidence = (await this.ctx.storage.get("loop_evidence")) ?? [];
+    const autoboot = (await this.ctx.storage.get("autoboot_enabled")) !== false;
     return {
-      state,
-      config,
-      autoboot_enabled: autoboot,
-      loop_count: count,
+      state, config, autoboot_enabled: autoboot, loop_count: count,
+      verified_two_plus_fires: evidence.length >= 2,
+      recent_alarm_fires: evidence,
       alarm_time_ms: alarmTime,
-      alarm_fire_at:
-        alarmTime == null
-          ? null
-          : new Date(alarmTime).toISOString()
+      alarm_fire_at: alarmTime == null ? null : new Date(alarmTime).toISOString()
     };
   }
 
   async getAlarmStatus() {
     const alarmTime = await this.ctx.storage.getAlarm();
-
-    return {
-      alarm_time_ms: alarmTime,
-      alarm_fire_at:
-        alarmTime == null
-          ? null
-          : new Date(alarmTime).toISOString()
-    };
+    return { alarm_time_ms: alarmTime, alarm_fire_at: alarmTime == null ? null : new Date(alarmTime).toISOString() };
   }
 
   async alarm() {
-    const previous =
-      (await this.ctx.storage.get("state")) ?? {};
-
-    const config =
-      (await this.ctx.storage.get("loop_config")) ?? {
-        enabled: false,
-        interval_seconds: null
-      };
-
-    const currentCount =
-      (await this.ctx.storage.get("loop_count")) ?? 0;
-
+    const previous = (await this.ctx.storage.get("state")) ?? {};
+    const config = (await this.ctx.storage.get("loop_config")) ?? { enabled: false, interval_seconds: null };
+    const currentCount = (await this.ctx.storage.get("loop_count")) ?? 0;
     const nextCount = currentCount + 1;
     const firedAt = new Date().toISOString();
-
     await this.ctx.storage.put("loop_count", nextCount);
-
     let nextFireAt = null;
-
     if (config.enabled && config.interval_seconds) {
-      nextFireAt =
-        Date.now() + Number(config.interval_seconds) * 1000;
-
+      nextFireAt = Date.now() + Number(config.interval_seconds) * 1000;
       await this.ctx.storage.setAlarm(nextFireAt);
     }
-
+    const evidence = (await this.ctx.storage.get("loop_evidence")) ?? [];
+    evidence.push({ count: nextCount, fired_at: firedAt, next_fire_at: nextFireAt == null ? null : new Date(nextFireAt).toISOString() });
+    while (evidence.length > 20) evidence.shift();
+    await this.ctx.storage.put("loop_evidence", evidence);
     const state = {
-      ...previous,
-      value: config.enabled ? "CLOUD_LOOP_RUNNING" : "CLOUD_TAKEOVER",
-      updated_at: firedAt,
-      alarm_fired_at: firedAt,
-      loop_enabled: !!config.enabled,
-      loop_count: nextCount,
-      alarm_interval_seconds:
-        config.interval_seconds ?? previous.alarm_interval_seconds ?? null,
-      alarm_fire_at:
-        nextFireAt == null
-          ? null
-          : new Date(nextFireAt).toISOString()
+      ...previous, value: config.enabled ? "CLOUD_LOOP_RUNNING" : "CLOUD_TAKEOVER",
+      updated_at: firedAt, alarm_fired_at: firedAt, loop_enabled: !!config.enabled,
+      loop_count: nextCount, alarm_interval_seconds: config.interval_seconds ?? previous.alarm_interval_seconds ?? null,
+      alarm_fire_at: nextFireAt == null ? null : new Date(nextFireAt).toISOString()
     };
-
     await this.ctx.storage.put("state", state);
   }
 }
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     const runtime = env.RUNTIME_STATE.getByName("main");
-
-    if (url.pathname === "/health") {
-      return Response.json({
-        ok: true,
-        service: "RCloud",
-        version: "0.4.1",
-        runtime: "cloudflare-worker+durable-object+self-rescheduling-alarm+cron-bootstrap",
-        time: new Date().toISOString()
-      });
-    }
-
-    if (url.pathname === "/state") {
-      const state = await runtime.getState();
-
-      return Response.json({
-        ok: true,
-        state
-      });
-    }
-
+    if (url.pathname === "/health") return Response.json({ ok: true, service: "RCloud", version: "0.5.0", runtime: "cloudflare-worker+durable-object+self-rescheduling-alarm+cron-bootstrap", time: new Date().toISOString() });
+    if (url.pathname === "/state") return Response.json({ ok: true, state: await runtime.getState() });
     if (url.pathname === "/state/set") {
       const value = url.searchParams.get("value");
-
-      if (!value) {
-        return Response.json(
-          {
-            ok: false,
-            error: "Missing ?value="
-          },
-          { status: 400 }
-        );
-      }
-
-      const state = await runtime.setState(value);
-
-      return Response.json({
-        ok: true,
-        state
-      });
+      if (!value) return Response.json({ ok: false, error: "Missing ?value=" }, { status: 400 });
+      return Response.json({ ok: true, state: await runtime.setState(value) });
     }
-
-    if (url.pathname === "/alarm/arm") {
-      const seconds = url.searchParams.get("seconds") ?? "120";
-      const result = await runtime.armAlarm(seconds);
-
-      return Response.json({
-        ok: true,
-        ...result
-      });
-    }
-
-    if (url.pathname === "/alarm/status") {
-      const result = await runtime.getAlarmStatus();
-
-      return Response.json({
-        ok: true,
-        ...result
-      });
-    }
-
-    if (url.pathname === "/loop/start") {
-      const seconds = url.searchParams.get("seconds") ?? "120";
-      const result = await runtime.startLoop(seconds);
-
-      return Response.json({
-        ok: true,
-        ...result
-      });
-    }
-
-    if (url.pathname === "/loop/ensure") {
-      const seconds = url.searchParams.get("seconds") ?? "120";
-      const result = await runtime.ensureLoop(seconds);
-
-      return Response.json({
-        ok: true,
-        ...result
-      });
-    }
-
-    if (url.pathname === "/loop/stop") {
-      const state = await runtime.stopLoop();
-
-      return Response.json({
-        ok: true,
-        state
-      });
-    }
-
-    if (url.pathname === "/loop/status") {
-      const result = await runtime.getLoopStatus();
-
-      return Response.json({
-        ok: true,
-        ...result
-      });
-    }
-
-    return new Response(
-      "RCloud is alive. Try /health, /state, /loop/status, or /loop/stop",
-      {
-        status: 200,
-        headers: {
-          "content-type": "text/plain; charset=utf-8"
-        }
-      }
-    );
+    if (url.pathname === "/alarm/arm") return Response.json({ ok: true, ...(await runtime.armAlarm(url.searchParams.get("seconds") ?? "120")) });
+    if (url.pathname === "/alarm/status") return Response.json({ ok: true, ...(await runtime.getAlarmStatus()) });
+    if (url.pathname === "/loop/start") return Response.json({ ok: true, ...(await runtime.startLoop(url.searchParams.get("seconds") ?? "120")) });
+    if (url.pathname === "/loop/ensure") return Response.json({ ok: true, ...(await runtime.ensureLoop(url.searchParams.get("seconds") ?? "120")) });
+    if (url.pathname === "/loop/stop") return Response.json({ ok: true, state: await runtime.stopLoop() });
+    if (url.pathname === "/loop/status") return Response.json({ ok: true, ...(await runtime.getLoopStatus()) });
+    return new Response("RCloud is alive. Try /health, /state, /loop/status, or /loop/stop", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
   },
-
   async scheduled(controller, env, ctx) {
     const runtime = env.RUNTIME_STATE.getByName("main");
     ctx.waitUntil(runtime.ensureLoop(120));
