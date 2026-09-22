@@ -10,9 +10,9 @@ test("queue index requires immutable path/request identity", () => {
 test("bounded drain skips terminal entries and processes unseen requests", async () => {
   const oldFetch = globalThis.fetch;
   const bodies = {
-    "A": { schema_version: 1, request_id: "A", target: "runtime:main", action: "NOOP", payload: {} },
-    "B": { schema_version: 1, request_id: "B", target: "runtime:main", action: "NOOP", payload: {} },
-    "C": { schema_version: 1, request_id: "C", target: "runtime:main", action: "NOOP", payload: {} }
+    A: { schema_version: 1, request_id: "A", target: "runtime:main", action: "NOOP", payload: {} },
+    B: { schema_version: 1, request_id: "B", target: "runtime:main", action: "NOOP", payload: {} },
+    C: { schema_version: 1, request_id: "C", target: "runtime:main", action: "NOOP", payload: {} }
   };
   globalThis.fetch = async url => {
     const u = String(url);
@@ -22,29 +22,30 @@ test("bounded drain skips terminal entries and processes unseen requests", async
   };
   try {
     const executed = [];
-    const result = await drainQueue({
-      isTerminal: async id => id === "A",
-      process: async command => { executed.push(command.request_id); return { status: "COMPLETED" }; },
-      limit: 1
-    });
+    const result = await drainQueue({ isTerminal: async id => id === "A", process: async command => { executed.push(command.request_id); return { status: "COMPLETED" }; }, limit: 1 });
     assert.deepEqual(executed, ["B"]);
     assert.equal(result.processed, 1);
     assert.equal(result.skipped_terminal, 1);
-  } finally {
-    globalThis.fetch = oldFetch;
-  }
+  } finally { globalThis.fetch = oldFetch; }
 });
 
-test("queue rejects a command routed to another target", async () => {
+test("bad target is visible but does not head-of-line block a valid request", async () => {
   const oldFetch = globalThis.fetch;
+  const bodies = {
+    X: { schema_version: 1, request_id: "X", target: "runtime:other", action: "NOOP", payload: {} },
+    Y: { schema_version: 1, request_id: "Y", target: "runtime:main", action: "NOOP", payload: {} }
+  };
   globalThis.fetch = async url => {
     const u = String(url);
-    if (u.includes("queue-index.json")) return new Response(JSON.stringify({ schema_version: 1, requests: [{ request_id: "X", path: "control/requests/X.json" }] }));
-    return new Response(JSON.stringify({ schema_version: 1, request_id: "X", target: "runtime:other", action: "NOOP", payload: {} }));
+    if (u.includes("queue-index.json")) return new Response(JSON.stringify({ schema_version: 1, requests: Object.keys(bodies).map(request_id => ({ request_id, path: `control/requests/${request_id}.json` })) }));
+    const id = Object.keys(bodies).find(x => u.includes(`/control/requests/${x}.json`));
+    return new Response(JSON.stringify(bodies[id]));
   };
   try {
-    await assert.rejects(() => drainQueue({ isTerminal: async () => false, process: async () => ({ status: "COMPLETED" }) }), /QUEUE_TARGET_MISMATCH/);
-  } finally {
-    globalThis.fetch = oldFetch;
-  }
+    const executed = [];
+    const result = await drainQueue({ isTerminal: async () => false, process: async command => { executed.push(command.request_id); return { status: "COMPLETED" }; }, limit: 2 });
+    assert.deepEqual(executed, ["Y"]);
+    assert.equal(result.rejected_transport, 1);
+    assert.match(result.results[0].error, /QUEUE_TARGET_MISMATCH/);
+  } finally { globalThis.fetch = oldFetch; }
 });
