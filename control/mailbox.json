@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "request_id": "BOOTSTRAP-NOOP-001",
+  "action": "NOOP",
+  "issued_at": "2026-09-22T09:31:00Z",
+  "payload": {}
+}
