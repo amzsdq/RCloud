@@ -1,4 +1,7 @@
 {
   "schema_version": 1,
-  "requests": []
+  "requests": [
+    {"request_id": "QUEUE-CANARY-A", "path": "control/requests/QUEUE-CANARY-A.json"},
+    {"request_id": "QUEUE-CANARY-B", "path": "control/requests/QUEUE-CANARY-B.json"}
+  ]
 }
