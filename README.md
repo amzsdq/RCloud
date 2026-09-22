@@ -16,7 +16,7 @@ Cloud-first persistent runtime prototype using Cloudflare Workers, Durable Objec
 {
   "schema_version": 1,
   "request_id": "globally-unique-id",
-  "action": "NOOP | START_LOOP | STOP_LOOP | AI_PROMPT",
+  "action": "NOOP | START_LOOP | STOP_LOOP | AI_PROMPT | QUARANTINE_STALE",
   "issued_at": "ISO-8601 timestamp",
   "payload": {}
 }
@@ -37,6 +37,8 @@ Semantics:
 The ledger retains up to 100 entries and never intentionally evicts a `PROCESSING` entry merely to satisfy the bound. This closes the previous `A → B → A` correctness gap for retained IDs. It is still a bounded deduplication window, not permanent global uniqueness.
 
 The latest 20 receipts and polling observations are retained as operational evidence. Cron polls the mailbox once per minute and retries transient **mailbox fetch** failures up to three times with bounded exponential backoff. Executor ambiguity is not automatically retried.
+
+v0.12 also exposes stale `PROCESSING` entries in `/mailbox/status`. After 5 minutes, a separate `QUARANTINE_STALE` command may terminalize a stale entry as `FAILED_AMBIGUOUS` without re-running its executor. This is deliberately not an assertion of success or failure of the original side effect: `outcome_still_ambiguous=true`, and a credentialed/irreversible action still requires external reconciliation before any replacement side effect is issued.
 
 For `AI_PROMPT`, `payload.prompt` must be non-empty and at most 4,000 characters. The executor caps generation at 512 tokens and persists the bounded result in Durable Object storage. It has no credentialed external side-effect tools.
 
@@ -61,10 +63,16 @@ Verified runtime evidence:
 - GitHub mailbox → Cloudflare cron poll → Workers AI → durable receipt: **PASS** — the same external probe observed `AI-CANARY-001` completed with `RCLOUD_AI_ALIVE`, model `@cf/zai-org/glm-4.7-flash`, and a durable terminal ledger entry.
 - repeated same-ID suppression: **PASS for consecutive polling** — poll history repeatedly returned `DUPLICATE` for the same AI canary without another execution while the same deployed ledger was active.
 
-Still pending dedicated deployed canaries: non-consecutive `A → B → A` suppression on v0.11, same-ID/different-fingerprint collision rejection, stale `PROCESSING` reconciliation, and forced mailbox-fetch retry/failure behavior.
+Still pending dedicated deployed canaries: non-consecutive `A → B → A` suppression, same-ID/different-fingerprint collision rejection under the hardened evidence predicate, stale `PROCESSING` quarantine, and forced mailbox-fetch retry/failure behavior. Earlier A/B/collision workflow successes that matched only an already-retained request ID are not counted as proof; the probe now requires a post-`issued_at` poll plus the expected fingerprint/receipt transition.
 
 ### Independent external probe
 
 `.github/workflows/runtime-evidence.yml` provides a second observation path that does not depend on the ChatGPT/web client being able to reach `workers.dev`. It probes `/health`, `/loop/status`, and `/mailbox/status` from a GitHub-hosted runner, retries transient HTTP failures, validates JSON, derives loop/AI canary evidence, and uploads the raw responses plus `summary.json` as a short-lived artifact. It is read-only against RCloud and has `contents: read` repository permission only.
 
 The probe runs on relevant main pushes, can be dispatched manually, and has a 15-minute scheduled backstop. A successful repository commit is still not a runtime PASS; the probe's captured deployed responses are the evidence.
+
+## Stop / recovery semantics
+
+- `STOP_LOOP` disables the self-rescheduling Durable Object alarm and sets `autoboot_enabled=false`.
+- The 1-minute cron control plane intentionally remains alive while the work loop is stopped, so GitHub can later deliver a new `START_LOOP` request.
+- `QUARANTINE_STALE` never replays an executor. It only moves a >=5 minute stale `PROCESSING` record to `FAILED_AMBIGUOUS` and preserves the ambiguity for explicit reconciliation.
