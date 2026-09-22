@@ -23,7 +23,7 @@ jobs:
         shell: bash
         env:
           BASE_URL: https://rcloud.amzsdq.workers.dev
-          EXPECTED_ID: BROWSER-AUTH-START-20260922T104700Z
+          EXPECTED_ID: BROWSER-AUTH-START-RETRY-002
         run: |
           set -euo pipefail
           mkdir -p evidence
@@ -42,7 +42,7 @@ jobs:
               m=json.loads(Path('evidence/mailbox-status.json').read_text())
           except Exception:
               raise SystemExit(1)
-          if h.get('version') != '0.14.1':
+          if h.get('version') != '0.14.2':
               raise SystemExit(1)
           rid=os.environ['EXPECTED_ID']
           receipts=list(m.get('recent_receipts') or [])
