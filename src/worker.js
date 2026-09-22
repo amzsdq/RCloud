@@ -1,7 +1,7 @@
 import baseWorker, { RuntimeState as BaseRuntimeState } from "./index.js";
 import { drainQueue } from "./queue.js";
 
-const QUEUE_RUNTIME_VERSION = "0.14.0";
+const QUEUE_RUNTIME_VERSION = "0.14.1";
 
 // Keep the exported/bound class name `RuntimeState` unchanged so the existing
 // Durable Object namespace and storage survive this rollout.
