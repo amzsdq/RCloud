@@ -7,6 +7,8 @@ on:
       - 'src/**'
       - 'test/**'
       - 'package.json'
+      - 'scripts/**'
+      - '.github/workflows/chatgpt-wake.yml'
       - '.github/workflows/unit.yml'
   workflow_dispatch:
 
@@ -27,3 +29,4 @@ jobs:
         with:
           node-version: '24'
       - run: npm test
+      - run: node --check scripts/wake-chatgpt.js
