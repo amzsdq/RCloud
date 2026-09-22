@@ -17,5 +17,10 @@
       "type": "durable-object",
       "storage": "sqlite"
     }
+  },
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
   }
 }
