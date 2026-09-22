@@ -32,7 +32,7 @@ export default {
       return Response.json({
         ok: true,
         service: "RCloud",
-        version: "0.2.0",
+        version: "0.2.1",
         runtime: "cloudflare-worker+durable-object",
         time: new Date().toISOString()
       });
