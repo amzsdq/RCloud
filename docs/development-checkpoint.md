@@ -1,38 +1,42 @@
 # RCloud development checkpoint
 
-Updated: 2026-09-22 19:30 KST
+Updated: 2026-09-22 19:31 KST
 
 ## Confirmed deployed evidence
 
-- Self-rescheduling Durable Object loop: PASS (multiple consecutive fires and next alarm observed).
+- Self-rescheduling Durable Object loop: PASS.
 - GitHub mailbox -> cron -> Workers AI -> durable receipt: PASS.
-- Same-ID/different-fingerprint rejection: PASS under hardened runtime evidence.
-- Non-consecutive A -> B -> A suppression: PASS under hardened exact-command correlation in run 35715423144.
-- Deployed v0.12.2 was observed by the hardened probe.
+- Same-ID/different-fingerprint rejection: PASS.
+- Non-consecutive A -> B -> A suppression: PASS (runtime-evidence 35715423144).
+- Queue-capable runtime v0.13.0 deployment: PASS (`queue-evidence` 35716287947, SUCCESS). `/health` and `/queue/status` both returned v0.13.0.
 
 ## Work completed this run
 
-1. Added loss-resistant queue namespace: immutable `control/requests/<request_id>.json` bodies plus ordered `control/queue-index.json`.
-2. Added `src/queue.js` bounded queue transport with cache-busted reads, path/body identity validation, explicit `runtime:main` target fence, retry, and per-item error isolation so one poison item does not block later requests.
-3. Added `src/worker.js` queue-capable entrypoint while preserving exported Durable Object class name/storage identity and legacy mailbox/loop path. Added `/queue/status` and queue poll history.
-4. Switched `wrangler.jsonc` entrypoint to queue-capable worker and exposed runtime version `0.13.0` for deployed correlation.
-5. Added unit tests and lightweight unit workflow. Latest observed unit run 35716142963 succeeded before the final safety gate change; final source change has a new queued evidence cycle.
-6. Added dedicated `queue-evidence` workflow and enqueued side-effect-free `QUEUE-CANARY-A` + `QUEUE-CANARY-B` before one poll.
-7. Extended runtime-evidence mailbox wait to two cron windows to avoid false negatives caused by cron phase/propagation timing.
+1. Added immutable `control/requests/<request_id>.json` queue bodies and ordered `control/queue-index.json`.
+2. Added bounded queue transport with retry, path/body identity validation, explicit `runtime:main` target fence, and per-item isolation so a poison item cannot block later work.
+3. Added queue-capable worker entrypoint without renaming the existing Durable Object binding/class; legacy mailbox and loop remain active during canary.
+4. Added `/queue/status`, queue poll history, unit tests, unit workflow, and dedicated deployed queue evidence workflow.
+5. Enqueued side-effect-free `QUEUE-CANARY-A` + `QUEUE-CANARY-B` before one poll.
+6. Extended mailbox runtime-evidence wait to two cron windows to reduce cron-phase false negatives.
+7. Added hard safety gate: experimental queue accepts `NOOP` only until durable cursor correctness is proven.
 
-## Important correctness finding / hard floor
+## Correctness findings / hard floors
 
-The request ledger is finite (retained window), while immutable queue requests may live indefinitely. Therefore ledger membership alone cannot be the long-term queue replay barrier: after ledger eviction, an old request could be observed as new and replay a side effect.
+### Finite-ledger replay hazard
 
-Until a monotonic durable `queue_cursor` is implemented and deployed, the experimental queue is intentionally gated to `NOOP` only (`QUEUE_ACTION_NOT_PROMOTED`). This keeps current A/B canaries safe while preventing AI or other side effects from being promoted prematurely.
+The request ledger is finite while immutable queue requests may live indefinitely. Ledger membership alone cannot be the long-term queue replay barrier. After ledger eviction an old queue request could otherwise replay. Queue promotion is blocked until a monotonic durable `queue_cursor` exists and is canary-proven.
+
+### Raw GitHub branch freshness gap
+
+Run 35716287947 proved v0.13.0 is deployed, but `/queue/status` at 10:30Z still reported `indexed: 0` for polls through 10:29Z even though fresh GitHub main contains A+B in `control/queue-index.json`. Cache-busting/no-store on `raw.githubusercontent.com/.../main/...` therefore is not sufficient evidence of prompt branch-head visibility. This is the next transport correctness issue; do not mark A+B PASS yet.
+
+Next candidate: use the GitHub Contents API for the mutable queue manifest (bounded frequency / rate-budgeted), while immutable request bodies can be addressed by commit/blob identity stored in the manifest. Do not add credentials unless the unauthenticated rate/freshness path proves insufficient.
 
 ## Next implementation order
 
-1. Implement monotonic Durable Object `queue_cursor`: terminal receipt persisted -> cursor persisted -> item consumed.
-2. Distinguish transient fetch failure (do not advance) from immutable invalid request (durable transport rejection then advance).
-3. Verify deployed v0.13.0 `/queue/status` and A+B terminal receipts using `queue-evidence`.
+1. Replace mutable queue-manifest raw-main read with a freshness-correct source and measure rate budget; prefer GitHub Contents API with bounded polling and immutable body commit/blob references.
+2. Implement monotonic Durable Object `queue_cursor`: terminal receipt -> persisted cursor -> consumed.
+3. Re-run A+B same-window canary and prove both terminal receipts.
 4. Canary 10 NOOP backlog, redeploy-with-pending, and safe ledger-eviction replay test.
-5. Only after cursor canaries pass, lift NOOP-only gate and promote queue transport for real self/cross-worker wake requests.
-6. Then implement target routing/wake adapters, stale-PROCESSING deployed canary, retry/stop/observability hardening.
-
-Latest strict production evidence remains v0.12.2 until queue-evidence proves v0.13.0 deployment.
+5. Only then lift NOOP-only gate and promote queue for real self/cross-worker wake requests.
+6. Proceed to target routing/wake adapters, stale-PROCESSING canary, retry/stop/observability.
