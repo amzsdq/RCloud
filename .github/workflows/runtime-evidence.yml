@@ -28,7 +28,7 @@ jobs:
         shell: bash
         env:
           BASE_URL: https://rcloud.amzsdq.workers.dev
-          RAW_MAILBOX: https://raw.githubusercontent.com/amzsdq/RCloud/main/control/mailbox.json
+          RAW_MAILBOX: https://raw.githubusercontent.com/amzsdq/RCloud/${{ github.sha }}/control/mailbox.json
         run: |
           set -euo pipefail
           mkdir -p evidence
@@ -51,7 +51,7 @@ jobs:
           # For mailbox-changing pushes, wait until the deployed cron has observed
           # the current mailbox request. This converts a race-prone snapshot into
           # durable execution evidence without exposing a mutating HTTP endpoint.
-          curl --fail --silent --show-error -H 'cache-control: no-cache' "$RAW_MAILBOX" -o evidence/expected-mailbox.json
+          curl --fail --silent --show-error -H 'cache-control: no-cache' "$RAW_MAILBOX?cb=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -o evidence/expected-mailbox.json
           expected_id="$(python -c 'import json; print(json.load(open("evidence/expected-mailbox.json")).get("request_id", ""))')"
           expected_issued_at="$(python -c 'import json; print(json.load(open("evidence/expected-mailbox.json")).get("issued_at", ""))')"
           expected_fingerprint="$(node - <<'NODE'
