@@ -2,6 +2,20 @@
 
 Cloud-first persistent runtime prototype using Cloudflare Workers, Durable Objects, alarms, cron bootstrap, GitHub as a durable control plane, and a bounded Workers AI executor.
 
+
+## ChatGPT wake transport
+
+The primary wake actuator is now **GitHub Actions + Playwright**, isolated behind the GitHub Environment `chatgpt-wake`.
+
+- `CHATGPT_STORAGE_STATE_B64` is stored only as an Environment secret.
+- `CHATGPT_WAKE_TARGET_URL` is stored only as an Environment secret for the first canary.
+- `.github/workflows/chatgpt-wake.yml` is manual-only until delivery is verified.
+- `scripts/wake-chatgpt.js` fails closed on missing/expired authentication and verifies that a new user message appeared after submit.
+- Cloudflare Browser Run is **not** a production wake dependency; its free daily browser-time limit makes it unsuitable for continuous relay use.
+- After the manual canary passes, the same actuator will be connected to the durable wake request/control event.
+
+Setup details: `docs/chatgpt-wake-environment.md`.
+
 ## Current runtime
 
 - `GET /health` — deployed version and runtime identity.
