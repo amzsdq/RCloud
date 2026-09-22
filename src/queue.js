@@ -39,6 +39,10 @@ export async function fetchQueuedCommand(item) {
   const command = await fetchJson(`${RAW_ROOT}/${item.path}`);
   if (!command || command.request_id !== item.request_id) throw new Error("QUEUE_BODY_ID_MISMATCH");
   if (command.target !== QUEUE_TARGET) throw new Error("QUEUE_TARGET_MISMATCH");
+  // Until monotonic durable cursor semantics are deployed, finite ledger eviction
+  // could make an old queue item observable again. Keep the experimental queue
+  // side-effect-free so that condition cannot replay AI or other effects.
+  if (command.action !== "NOOP") throw new Error("QUEUE_ACTION_NOT_PROMOTED");
   return command;
 }
 
@@ -61,8 +65,6 @@ export async function drainQueue({ isTerminal, process, limit = QUEUE_BATCH_LIMI
       results.push({ request_id: item.request_id, status: receipt?.status ?? "UNKNOWN" });
       processed += 1;
     } catch (error) {
-      // One malformed/unavailable request must not head-of-line block unrelated
-      // later requests. Keep it visible in poll evidence and retry on a later cron.
       rejectedTransport += 1;
       results.push({ request_id: item.request_id, status: "TRANSPORT_ERROR", error: String(error) });
     }
