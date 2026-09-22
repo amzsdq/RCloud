@@ -1,6 +1,6 @@
 # Durable request ledger — implementation contract
 
-Status: REQUIRED before credentialed or irreversible executors.
+Status: IMPLEMENTED FOR BOUNDED LEDGER; DEPLOYED CANARIES/RECOVERY HARDENING STILL REQUIRED before credentialed or irreversible executors.
 
 ## Problem
 
@@ -14,7 +14,7 @@ Store a bounded ledger in Durable Object storage keyed by request ID:
 request_ledger = {
   request_id: {
     fingerprint,
-    state: PROCESSING | COMPLETED | REJECTED | FAILED_RETRYABLE,
+    state: PROCESSING | COMPLETED | REJECTED | FAILED_AMBIGUOUS,
     first_seen_at,
     updated_at,
     receipt
@@ -32,7 +32,8 @@ Keep at least the latest 100 terminal request IDs for the prototype. Never evict
 3. If request ID exists with a different fingerprint: reject `REQUEST_ID_COLLISION`; do not invoke executor.
 4. If request ID exists as `COMPLETED` or `REJECTED` with same fingerprint: return stored terminal receipt; do not invoke executor.
 5. If request ID exists as `PROCESSING`: do not blindly re-run. Return/record `IN_FLIGHT_OR_INTERRUPTED` until action-specific recovery resolves it.
-6. `FAILED_RETRYABLE` may be retried only when the action explicitly declares retry safety.
+6. `FAILED_AMBIGUOUS` is never automatically retried.
+7. A >=5 minute stale `PROCESSING` entry may be moved to `FAILED_AMBIGUOUS` by a distinct `QUARANTINE_STALE` request. This changes ledger state only; it does not claim the original side effect failed and does not authorize replay.
 
 ## Crash semantics
 
@@ -52,7 +53,7 @@ The implementation is not PASS until deployed evidence demonstrates:
 - `A → B → A`: final A does not execute.
 - `A(payload=1) → A(payload=2)`: collision rejected.
 - forced executor failure: terminal/retry state is explicit; no false `COMPLETED`.
-- simulated `PROCESSING` recovery: no blind duplicate side effect.
+- simulated stale `PROCESSING` quarantine: no blind duplicate side effect and outcome remains explicitly ambiguous.
 
 ## Promotion rule
 
