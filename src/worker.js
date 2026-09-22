@@ -1,6 +1,8 @@
 import baseWorker, { RuntimeState as BaseRuntimeState } from "./index.js";
 import { drainQueue } from "./queue.js";
 
+const QUEUE_RUNTIME_VERSION = "0.13.0";
+
 // Keep the exported/bound class name `RuntimeState` unchanged so the existing
 // Durable Object namespace and storage survive this rollout.
 export class RuntimeState extends BaseRuntimeState {
@@ -51,7 +53,12 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/queue/status") {
       const runtime = env.RUNTIME_STATE.getByName("main");
-      return Response.json({ ok: true, ...(await runtime.getQueueStatus()) });
+      return Response.json({ ok: true, version: QUEUE_RUNTIME_VERSION, ...(await runtime.getQueueStatus()) });
+    }
+    if (url.pathname === "/health") {
+      const base = await baseWorker.fetch(request, env);
+      const body = await base.json();
+      return Response.json({ ...body, version: QUEUE_RUNTIME_VERSION, queue_transport: "github-immutable-request-files" });
     }
     return baseWorker.fetch(request, env);
   },
