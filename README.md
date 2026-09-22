@@ -55,3 +55,9 @@ Repository state proves only what was committed. Runtime capabilities are promot
 Previously verified manually: Worker health, Durable Object persistence across redeploy, and one-shot Durable Object alarm execution. The runtime records up to 20 alarm firings so repeated self-rescheduling can be verified without relying on browser timing. GitHub mailbox control, durable non-consecutive idempotency, collision rejection, retry evidence, repeated self-loop execution, and Workers AI execution remain canary/pending until deployed runtime evidence confirms them.
 
 Current AI canary: `AI-CANARY-001` requests the exact response `RCLOUD_AI_ALIVE`. Promotion requires a deployed `/mailbox/status` receipt proving execution; repository code or a successful commit alone is not sufficient evidence.
+
+### Independent external probe
+
+`.github/workflows/runtime-evidence.yml` provides a second observation path that does not depend on the ChatGPT/web client being able to reach `workers.dev`. It probes `/health`, `/loop/status`, and `/mailbox/status` from a GitHub-hosted runner, retries transient HTTP failures, validates JSON, derives loop/AI canary evidence, and uploads the raw responses plus `summary.json` as a short-lived artifact. It is read-only against RCloud and has `contents: read` repository permission only.
+
+The probe runs on relevant main pushes, can be dispatched manually, and has a 15-minute scheduled backstop. A successful repository commit is still not a runtime PASS; the probe's captured deployed responses are the evidence.
