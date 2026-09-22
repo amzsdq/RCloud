@@ -22,7 +22,9 @@ Cloud-first persistent runtime prototype using Cloudflare Workers, Durable Objec
 }
 ```
 
-`request_id` is the idempotency key. Each accepted command also gets a SHA-256 fingerprint over its execution-relevant fields. Re-reading the same request ID with the same fingerprint returns `DUPLICATE` rather than re-running its side effect. Reusing an existing request ID with changed action/payload is rejected as `REQUEST_ID_COLLISION`; it is never silently treated as the original command. The latest 20 receipts are retained as durable evidence.
+`request_id` is intended to be the idempotency key. Each command gets a SHA-256 fingerprint over its execution-relevant fields. **Current v0.10 implementation only compares against the immediately preceding request.** Therefore it suppresses consecutive re-reads of the same mailbox command and rejects an immediate same-ID/different-payload collision, but it does **not yet provide global idempotency after a different request has been processed**. Example: `A → B → A` can execute A twice. This is a correctness gap, not a verified capability. The next hardening step is a bounded durable request ledger keyed by `request_id`, retaining fingerprint and terminal receipt so any retained ID is duplicate/collision checked independently of mailbox order.
+
+The latest 20 receipts are retained as operational evidence, but receipt history alone is not currently used as the idempotency index.
 
 Cron polls the mailbox once per minute and retries transient fetch/execution failures up to three times with bounded exponential backoff. Poll outcomes are retained in Durable Object storage for observability.
 
@@ -34,10 +36,12 @@ The repository is the authority for commands. Do not put credentials or secrets 
 
 The command fingerprint intentionally excludes `issued_at`: changing metadata alone does not create a new side effect. A genuinely new execution must use a new `request_id`.
 
+Before credentialed or irreversible executors are added, RCloud must replace last-request-only suppression with the durable request ledger and define recovery semantics for `PROCESSING` entries. No irreversible side effect should be promoted while execution is merely at-least-once.
+
 ## Evidence policy
 
 Repository state proves only what was committed. Runtime capabilities are promoted to PASS only from deployed runtime evidence. In particular, a commit containing an executor is not proof that Cloudflare deployed it or that the executor ran.
 
-Previously verified manually: Worker health, Durable Object persistence across redeploy, and one-shot Durable Object alarm execution. The runtime records up to 20 alarm firings so repeated self-rescheduling can be verified without relying on browser timing. GitHub mailbox control, duplicate suppression/collision rejection, retry evidence, repeated self-loop execution, and Workers AI execution remain canary/pending until deployed runtime evidence confirms them.
+Previously verified manually: Worker health, Durable Object persistence across redeploy, and one-shot Durable Object alarm execution. The runtime records up to 20 alarm firings so repeated self-rescheduling can be verified without relying on browser timing. GitHub mailbox control, durable non-consecutive idempotency, collision rejection, retry evidence, repeated self-loop execution, and Workers AI execution remain canary/pending until deployed runtime evidence confirms them.
 
 Current AI canary: `AI-CANARY-001` requests the exact response `RCLOUD_AI_ALIVE`. Promotion requires a deployed `/mailbox/status` receipt proving execution; repository code or a successful commit alone is not sufficient evidence.
