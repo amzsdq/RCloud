@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 
 const clampSeconds = (value, fallback = 120) => Math.max(5, Math.min(Number(value) || fallback, 3600));
 const MAILBOX_URL = "https://raw.githubusercontent.com/amzsdq/RCloud/main/control/mailbox.json";
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export class RuntimeState extends DurableObject {
   constructor(ctx, env) { super(ctx, env); }
@@ -56,7 +57,13 @@ export class RuntimeState extends DurableObject {
     await this.ctx.storage.put("mailbox_last_request_id", command.request_id); await this.ctx.storage.put("mailbox_receipt", receipt); return receipt;
   }
 
-  async getMailboxStatus() { return { last_request_id: (await this.ctx.storage.get("mailbox_last_request_id")) ?? null, receipt: (await this.ctx.storage.get("mailbox_receipt")) ?? null }; }
+  async recordPoll(observation) {
+    const history = (await this.ctx.storage.get("poll_history")) ?? [];
+    history.push(observation); while (history.length > 20) history.shift();
+    await this.ctx.storage.put("poll_history", history); await this.ctx.storage.put("last_poll", observation);
+  }
+
+  async getMailboxStatus() { return { last_request_id: (await this.ctx.storage.get("mailbox_last_request_id")) ?? null, receipt: (await this.ctx.storage.get("mailbox_receipt")) ?? null, last_poll: (await this.ctx.storage.get("last_poll")) ?? null, recent_polls: (await this.ctx.storage.get("poll_history")) ?? [] }; }
 
   async alarm() {
     const previous = (await this.ctx.storage.get("state")) ?? {}, config = (await this.ctx.storage.get("loop_config")) ?? { enabled: false, interval_seconds: null };
@@ -69,14 +76,28 @@ export class RuntimeState extends DurableObject {
 }
 
 async function pollMailbox(runtime) {
-  try { const response = await fetch(MAILBOX_URL, { headers: { "user-agent": "RCloud/0.7" } }); if (!response.ok) return { ok: false, status: "FETCH_FAILED", http_status: response.status }; return await runtime.processMailbox(await response.json()); }
-  catch (error) { return { ok: false, status: "FETCH_ERROR", error: String(error) }; }
+  const startedAt = new Date().toISOString();
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await fetch(MAILBOX_URL, { headers: { "user-agent": "RCloud/0.8", "cache-control": "no-cache" } });
+      if (!response.ok) throw new Error(`HTTP_${response.status}`);
+      const receipt = await runtime.processMailbox(await response.json());
+      const observation = { ok: true, status: "POLL_OK", attempt, started_at: startedAt, finished_at: new Date().toISOString(), request_id: receipt.request_id ?? null, receipt_status: receipt.status };
+      await runtime.recordPoll(observation); return observation;
+    } catch (error) {
+      lastError = String(error);
+      if (attempt < 3) await sleep(250 * (2 ** (attempt - 1)));
+    }
+  }
+  const observation = { ok: false, status: "POLL_FAILED", attempts: 3, started_at: startedAt, finished_at: new Date().toISOString(), error: lastError };
+  await runtime.recordPoll(observation); return observation;
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url), runtime = env.RUNTIME_STATE.getByName("main");
-    if (url.pathname === "/health") return Response.json({ ok: true, service: "RCloud", version: "0.7.0", runtime: "cloudflare-worker+durable-object+alarm+cron+github-mailbox", control_plane: "github-main", time: new Date().toISOString() });
+    if (url.pathname === "/health") return Response.json({ ok: true, service: "RCloud", version: "0.8.0", runtime: "cloudflare-worker+durable-object+alarm+cron+github-mailbox", control_plane: "github-main", time: new Date().toISOString() });
     if (url.pathname === "/state") return Response.json({ ok: true, state: await runtime.getState() });
     if (url.pathname === "/loop/status") return Response.json({ ok: true, ...(await runtime.getLoopStatus()) });
     if (url.pathname === "/mailbox/status") return Response.json({ ok: true, ...(await runtime.getMailboxStatus()) });
