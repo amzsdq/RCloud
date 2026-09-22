@@ -22,7 +22,7 @@ concurrency:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 5
     steps:
       - name: Probe deployed read-only runtime
         shell: bash
@@ -48,9 +48,8 @@ jobs:
           retry_get /health evidence/health.json
           retry_get /loop/status evidence/loop-status.json
 
-          # For mailbox-changing pushes, wait until the deployed cron has observed
-          # the current mailbox request. This converts a race-prone snapshot into
-          # durable execution evidence without exposing a mutating HTTP endpoint.
+          # Cron is once per minute. Allow two full cron windows plus propagation
+          # margin so a healthy delayed observation does not become a false failure.
           curl --fail --silent --show-error -H 'cache-control: no-cache' "$RAW_MAILBOX?cb=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -o evidence/expected-mailbox.json
           expected_id="$(python -c 'import json; print(json.load(open("evidence/expected-mailbox.json")).get("request_id", ""))')"
           expected_issued_at="$(python -c 'import json; print(json.load(open("evidence/expected-mailbox.json")).get("issued_at", ""))')"
@@ -58,18 +57,13 @@ jobs:
           const fs = require('fs');
           const crypto = require('crypto');
           const c = JSON.parse(fs.readFileSync('evidence/expected-mailbox.json', 'utf8'));
-          const stable = JSON.stringify({
-            schema_version: c?.schema_version,
-            request_id: c?.request_id,
-            action: c?.action,
-            payload: c?.payload ?? null
-          });
+          const stable = JSON.stringify({ schema_version: c?.schema_version, request_id: c?.request_id, action: c?.action, payload: c?.payload ?? null });
           process.stdout.write(crypto.createHash('sha256').update(stable).digest('hex'));
           NODE
           )"
 
           matched=false
-          for attempt in 1 2 3 4 5 6 7; do
+          for attempt in $(seq 1 13); do
             retry_get /mailbox/status evidence/mailbox-status.json
             if EXPECTED_ID="$expected_id" EXPECTED_FP="$expected_fingerprint" EXPECTED_ISSUED_AT="$expected_issued_at" python - <<'PY'
           import json, os
@@ -85,12 +79,10 @@ jobs:
           expected_id = os.environ.get('EXPECTED_ID', '')
           expected_fp = os.environ.get('EXPECTED_FP', '')
           issued_at = dt(os.environ.get('EXPECTED_ISSUED_AT', ''))
-
           ledger = {str(x.get('request_id', '')): x for x in (m.get('recent_ledger') or [])}
           entry = ledger.get(expected_id)
           poll = m.get('last_poll') or {}
           receipt = m.get('receipt') or {}
-
           if not expected_id or not expected_fp or not entry:
               raise SystemExit(1)
           if str(poll.get('request_id', '')) != expected_id:
@@ -98,28 +90,20 @@ jobs:
           poll_finished = dt(poll.get('finished_at'))
           if issued_at and (not poll_finished or poll_finished < issued_at):
               raise SystemExit(1)
-          # v0.12.2+ records the exact command identity observed by the Worker.
-          # Require it when available so stale CDN reads cannot masquerade as
-          # evidence for the trigger commit.
           observed_issued = poll.get('command_issued_at')
           observed_fp = poll.get('observed_fingerprint')
           if observed_issued is not None and str(observed_issued) != os.environ.get('EXPECTED_ISSUED_AT', ''):
               raise SystemExit(1)
           if observed_fp is not None and str(observed_fp) != expected_fp:
               raise SystemExit(1)
-
           ledger_fp = str(entry.get('fingerprint', ''))
           if ledger_fp == expected_fp:
-              # If the retained execution predates this mailbox issuance, this
-              # observation must be a DUPLICATE, not merely an old ledger hit.
               started_at = dt(entry.get('started_at'))
               if issued_at and started_at and started_at < issued_at:
                   ok = poll.get('receipt_status') == 'DUPLICATE'
               else:
                   ok = poll.get('receipt_status') in ('COMPLETED', 'DUPLICATE')
           else:
-              # Reusing an existing request_id with a different command must
-              # produce an explicit collision receipt for the new fingerprint.
               ok = (
                   poll.get('receipt_status') == 'REJECTED'
                   and receipt.get('request_id') == expected_id
@@ -128,7 +112,6 @@ jobs:
                   and str(receipt.get('expected_fingerprint', '')) == ledger_fp
                   and str(receipt.get('received_fingerprint', '')) == expected_fp
               )
-
           raise SystemExit(0 if ok else 1)
           PY
             then
@@ -141,30 +124,20 @@ jobs:
           python - <<'PY'
           import json
           from pathlib import Path
-
           health = json.loads(Path('evidence/health.json').read_text())
           loop = json.loads(Path('evidence/loop-status.json').read_text())
           mailbox = json.loads(Path('evidence/mailbox-status.json').read_text())
-
           assert health.get('ok') is True, health
           version = str(health.get('version', ''))
           assert version, health
-
           fires = loop.get('recent_alarm_fires') or []
           loop_pass = bool(loop.get('verified_two_plus_fires')) and len(fires) >= 2
-
           receipts = mailbox.get('recent_receipts') or []
           receipt = mailbox.get('receipt')
           if receipt:
             receipts = receipts + [receipt]
           ai_receipts = [r for r in receipts if r.get('request_id') == 'AI-CANARY-001']
-          ai_pass = any(
-              r.get('ok') is True
-              and r.get('action') == 'AI_PROMPT'
-              and 'RCLOUD_AI_ALIVE' in str((r.get('result') or {}).get('output', ''))
-              for r in ai_receipts
-          )
-
+          ai_pass = any(r.get('ok') is True and r.get('action') == 'AI_PROMPT' and 'RCLOUD_AI_ALIVE' in str((r.get('result') or {}).get('output', '')) for r in ai_receipts)
           report = {
               'runtime_reachable': True,
               'version': version,
