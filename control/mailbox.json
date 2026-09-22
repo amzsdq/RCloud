@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "request_id": "RCLOUD-IDLE-20260922T102122Z",
-  "action": "NOOP",
-  "issued_at": "2026-09-22T10:21:22Z",
+  "request_id": "BROWSER-AUTH-START-20260922T104700Z",
+  "action": "AUTH_START",
+  "issued_at": "2026-09-22T10:47:00Z",
   "payload": {
-    "purpose": "neutral mailbox after strict ledger canaries"
+    "purpose": "B64-free ChatGPT auth persistence canary"
   }
 }
