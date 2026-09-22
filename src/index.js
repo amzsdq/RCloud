@@ -158,7 +158,7 @@ async function pollMailbox(runtime) {
   const startedAt = new Date().toISOString(); let lastError = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const response = await fetch(MAILBOX_URL, { headers: { "user-agent": "RCloud/0.12", "cache-control": "no-cache" } }); if (!response.ok) throw new Error(`HTTP_${response.status}`);
+      const mailboxUrl = `${MAILBOX_URL}?cb=${Date.now()}`; const response = await fetch(mailboxUrl, { headers: { "user-agent": "RCloud/0.12.1", "cache-control": "no-store" } }); if (!response.ok) throw new Error(`HTTP_${response.status}`);
       const receipt = await runtime.processMailbox(await response.json()); const observation = { ok: true, status: "POLL_OK", attempt, started_at: startedAt, finished_at: new Date().toISOString(), request_id: receipt.request_id ?? null, receipt_status: receipt.status };
       await runtime.recordPoll(observation); return observation;
     } catch (error) { lastError = String(error); if (attempt < 3) await sleep(250 * (2 ** (attempt - 1))); }
@@ -169,7 +169,7 @@ async function pollMailbox(runtime) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url), runtime = env.RUNTIME_STATE.getByName("main");
-    if (url.pathname === "/health") return Response.json({ ok: true, service: "RCloud", version: "0.12.0", runtime: "cloudflare-worker+durable-object+alarm+cron+github-mailbox+workers-ai+request-ledger+stale-quarantine", control_plane: "github-main", ai_model: AI_MODEL, time: new Date().toISOString() });
+    if (url.pathname === "/health") return Response.json({ ok: true, service: "RCloud", version: "0.12.1", runtime: "cloudflare-worker+durable-object+alarm+cron+github-mailbox+workers-ai+request-ledger+stale-quarantine", control_plane: "github-main", ai_model: AI_MODEL, time: new Date().toISOString() });
     if (url.pathname === "/state") return Response.json({ ok: true, state: await runtime.getState() });
     if (url.pathname === "/loop/status") return Response.json({ ok: true, ...(await runtime.getLoopStatus()) });
     if (url.pathname === "/mailbox/status") return Response.json({ ok: true, ...(await runtime.getMailboxStatus()) });
