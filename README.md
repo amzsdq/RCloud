@@ -7,7 +7,7 @@ Cloud-first persistent runtime prototype using Cloudflare Workers, Durable Objec
 - `GET /health` — deployed version and runtime identity.
 - `GET /state` — durable runtime state.
 - `GET /loop/status` — self-rescheduling alarm evidence and next wake.
-- `GET /mailbox/status` — last GitHub mailbox receipt, recent receipt history, last AI result, and recent polling observations.
+- `GET /mailbox/status` — mailbox receipt/history, bounded durable request ledger, AI result, and polling observations.
 - Public HTTP surface is read-only. Runtime mutations are accepted only through `control/mailbox.json` on GitHub main.
 
 ## Mailbox schema
@@ -22,11 +22,21 @@ Cloud-first persistent runtime prototype using Cloudflare Workers, Durable Objec
 }
 ```
 
-`request_id` is intended to be the idempotency key. Each command gets a SHA-256 fingerprint over its execution-relevant fields. **Current v0.10 implementation only compares against the immediately preceding request.** Therefore it suppresses consecutive re-reads of the same mailbox command and rejects an immediate same-ID/different-payload collision, but it does **not yet provide global idempotency after a different request has been processed**. Example: `A → B → A` can execute A twice. This is a correctness gap, not a verified capability. The next hardening step is a bounded durable request ledger keyed by `request_id`, retaining fingerprint and terminal receipt so any retained ID is duplicate/collision checked independently of mailbox order.
+## Durable idempotency ledger
 
-The latest 20 receipts are retained as operational evidence, but receipt history alone is not currently used as the idempotency index.
+v0.11 uses a bounded Durable Object ledger keyed by `request_id` rather than only comparing the immediately preceding request. Each retained entry stores a SHA-256 fingerprint over execution-relevant fields, action, lifecycle state, timestamps, and terminal receipt.
 
-Cron polls the mailbox once per minute and retries transient fetch/execution failures up to three times with bounded exponential backoff. Poll outcomes are retained in Durable Object storage for observability.
+Semantics:
+
+- unseen ID → persist `PROCESSING` **before** executor invocation;
+- same ID + same fingerprint + terminal state → return `DUPLICATE` without re-execution;
+- same ID + different fingerprint → reject `REQUEST_ID_COLLISION`;
+- same ID while `PROCESSING` → suppress retry/re-execution;
+- executor exception → persist `FAILED_AMBIGUOUS`; automatic retry is suppressed because the side effect may have occurred before the failure became observable.
+
+The ledger retains up to 100 entries and never intentionally evicts a `PROCESSING` entry merely to satisfy the bound. This closes the previous `A → B → A` correctness gap for retained IDs. It is still a bounded deduplication window, not permanent global uniqueness.
+
+The latest 20 receipts and polling observations are retained as operational evidence. Cron polls the mailbox once per minute and retries transient **mailbox fetch** failures up to three times with bounded exponential backoff. Executor ambiguity is not automatically retried.
 
 For `AI_PROMPT`, `payload.prompt` must be non-empty and at most 4,000 characters. The executor caps generation at 512 tokens and persists the bounded result in Durable Object storage. It has no credentialed external side-effect tools.
 
@@ -36,7 +46,7 @@ The repository is the authority for commands. Do not put credentials or secrets 
 
 The command fingerprint intentionally excludes `issued_at`: changing metadata alone does not create a new side effect. A genuinely new execution must use a new `request_id`.
 
-Before credentialed or irreversible executors are added, RCloud must replace last-request-only suppression with the durable request ledger and define recovery semantics for `PROCESSING` entries. No irreversible side effect should be promoted while execution is merely at-least-once.
+Before credentialed or irreversible executors are added, recovery of stale `PROCESSING` / `FAILED_AMBIGUOUS` entries must require action-specific reconciliation rather than blind replay. No irreversible side effect should be promoted while outcome is ambiguous.
 
 ## Evidence policy
 
