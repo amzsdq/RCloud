@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { launch, connect } from "@cloudflare/playwright";
 
 const clampSeconds = (value, fallback = 120) => Math.max(5, Math.min(Number(value) || fallback, 3600));
 const MAILBOX_URL = "https://raw.githubusercontent.com/amzsdq/RCloud/main/control/mailbox.json";
@@ -42,6 +43,108 @@ export class RuntimeState extends DurableObject {
     const state = await this.getState(), config = (await this.ctx.storage.get("loop_config")) ?? { enabled: false, interval_seconds: null };
     const alarmTime = await this.ctx.storage.getAlarm(), count = (await this.ctx.storage.get("loop_count")) ?? 0, evidence = (await this.ctx.storage.get("loop_evidence")) ?? [];
     return { state, config, autoboot_enabled: (await this.ctx.storage.get("autoboot_enabled")) !== false, loop_count: count, verified_two_plus_fires: evidence.length >= 2, recent_alarm_fires: evidence, alarm_time_ms: alarmTime, alarm_fire_at: alarmTime == null ? null : new Date(alarmTime).toISOString() };
+  }
+
+  async startBrowserAuth() {
+    const startedAt = new Date().toISOString();
+    const browser = await launch(this.env.BROWSER, { keep_alive: 600000 });
+    const page = await browser.newPage();
+    await page.goto("https://chatgpt.com/", { waitUntil: "domcontentloaded", timeout: 30000 });
+    const sessionId = browser.sessionId();
+    await this.ctx.storage.put("browser_auth_session", {
+      session_id: sessionId,
+      phase: "WAITING_FOR_HUMAN_LOGIN",
+      started_at: startedAt,
+      updated_at: new Date().toISOString()
+    });
+    await this.ctx.storage.put("browser_auth_status", {
+      phase: "WAITING_FOR_HUMAN_LOGIN",
+      started_at: startedAt,
+      updated_at: new Date().toISOString(),
+      target: "chatgpt.com",
+      keep_alive_seconds: 600
+    });
+    // Intentionally do not close: Browser Run keeps this session available for
+    // human login through Cloudflare Dashboard > Browser Run > Live Sessions.
+    return {
+      ok: true,
+      phase: "WAITING_FOR_HUMAN_LOGIN",
+      target: "chatgpt.com",
+      keep_alive_seconds: 600,
+      instruction: "Open Cloudflare Dashboard > Browser Run > Live Sessions, open the active RCloud session, log in to ChatGPT, then issue AUTH_CAPTURE."
+    };
+  }
+
+  async captureBrowserAuth() {
+    const session = await this.ctx.storage.get("browser_auth_session");
+    if (!session?.session_id) return { ok: false, error: "NO_ACTIVE_AUTH_SESSION" };
+
+    const browser = await connect(this.env.BROWSER, session.session_id);
+    try {
+      const contexts = browser.contexts();
+      const context = contexts[0] ?? await browser.newContext();
+      const pages = context.pages();
+      const page = pages[0] ?? await context.newPage();
+      const state = await context.storageState({ indexedDB: true });
+      const now = new Date().toISOString();
+      await this.ctx.storage.put("browser_auth_state", state);
+      const status = {
+        phase: "CAPTURED",
+        captured_at: now,
+        updated_at: now,
+        cookie_count: Array.isArray(state.cookies) ? state.cookies.length : 0,
+        origin_count: Array.isArray(state.origins) ? state.origins.length : 0,
+        target: "chatgpt.com"
+      };
+      await this.ctx.storage.put("browser_auth_status", status);
+      return { ok: true, ...status };
+    } finally {
+      // A browser obtained via connect() disconnects rather than terminating
+      // the Browser Run session when close() is called.
+      await browser.close();
+    }
+  }
+
+  async verifyBrowserAuth() {
+    const state = await this.ctx.storage.get("browser_auth_state");
+    if (!state) return { ok: false, error: "NO_CAPTURED_AUTH_STATE" };
+
+    const browser = await launch(this.env.BROWSER, { keep_alive: 60000 });
+    try {
+      const context = await browser.newContext({ storageState: state });
+      const page = await context.newPage();
+      await page.goto("https://chatgpt.com/", { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(2000);
+      const probe = await page.evaluate(async () => {
+        try {
+          const response = await fetch("/api/auth/session", { credentials: "include" });
+          const body = await response.json().catch(() => null);
+          return { http_status: response.status, authenticated: !!body?.user };
+        } catch {
+          return { http_status: null, authenticated: false };
+        }
+      });
+      const now = new Date().toISOString();
+      const status = {
+        phase: probe.authenticated ? "VERIFIED" : "VERIFY_FAILED",
+        verified_at: now,
+        updated_at: now,
+        authenticated: probe.authenticated,
+        auth_probe_http_status: probe.http_status,
+        target: "chatgpt.com"
+      };
+      await this.ctx.storage.put("browser_auth_status", status);
+      return { ok: probe.authenticated, ...status };
+    } finally {
+      await browser.close();
+    }
+  }
+
+  async getBrowserAuthStatus() {
+    return (await this.ctx.storage.get("browser_auth_status")) ?? {
+      phase: "NOT_CONFIGURED",
+      target: "chatgpt.com"
+    };
   }
 
   async runAI(payload) {
@@ -118,6 +221,9 @@ export class RuntimeState extends DurableObject {
       else if (command.action === "START_LOOP") result = await this.startLoop(command.payload?.seconds ?? 120);
       else if (command.action === "STOP_LOOP") result = await this.stopLoop();
       else if (command.action === "AI_PROMPT") { result = await this.runAI(command.payload); accepted = result.ok === true; }
+      else if (command.action === "AUTH_START") { result = await this.startBrowserAuth(); accepted = result.ok === true; }
+      else if (command.action === "AUTH_CAPTURE") { result = await this.captureBrowserAuth(); accepted = result.ok === true; }
+      else if (command.action === "AUTH_VERIFY") { result = await this.verifyBrowserAuth(); accepted = result.ok === true; }
       else if (command.action === "QUARANTINE_STALE") { result = await this.quarantineStale(command.payload, command.request_id); accepted = result.ok === true; }
       else { accepted = false; result = { error: "UNSUPPORTED_ACTION" }; }
       const receipt = { ok: accepted, status: accepted ? "COMPLETED" : "REJECTED", request_id: command.request_id, fingerprint, action: command.action, started_at: startedAt, processed_at: new Date().toISOString(), result };
@@ -176,7 +282,8 @@ export default {
     if (url.pathname === "/state") return Response.json({ ok: true, state: await runtime.getState() });
     if (url.pathname === "/loop/status") return Response.json({ ok: true, ...(await runtime.getLoopStatus()) });
     if (url.pathname === "/mailbox/status") return Response.json({ ok: true, ...(await runtime.getMailboxStatus()) });
-    return new Response("RCloud read-only API. Try /health, /state, /loop/status, or /mailbox/status", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+    if (url.pathname === "/auth/status") return Response.json({ ok: true, ...(await runtime.getBrowserAuthStatus()) });
+    return new Response("RCloud read-only API. Try /health, /state, /loop/status, /mailbox/status, or /auth/status", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
   },
   async scheduled(controller, env, ctx) { const runtime = env.RUNTIME_STATE.getByName("main"); ctx.waitUntil(Promise.all([runtime.ensureLoop(120), pollMailbox(runtime)])); }
 };
