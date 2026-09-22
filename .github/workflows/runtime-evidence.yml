@@ -51,18 +51,76 @@ jobs:
           # For mailbox-changing pushes, wait until the deployed cron has observed
           # the current mailbox request. This converts a race-prone snapshot into
           # durable execution evidence without exposing a mutating HTTP endpoint.
-          expected_id="$(curl --fail --silent --show-error -H 'cache-control: no-cache' "$RAW_MAILBOX" | python -c 'import json,sys; print(json.load(sys.stdin).get("request_id", ""))')"
+          curl --fail --silent --show-error -H 'cache-control: no-cache' "$RAW_MAILBOX" -o evidence/expected-mailbox.json
+          expected_id="$(python -c 'import json; print(json.load(open("evidence/expected-mailbox.json")).get("request_id", ""))')"
+          expected_issued_at="$(python -c 'import json; print(json.load(open("evidence/expected-mailbox.json")).get("issued_at", ""))')"
+          expected_fingerprint="$(node - <<'NODE'
+          const fs = require('fs');
+          const crypto = require('crypto');
+          const c = JSON.parse(fs.readFileSync('evidence/expected-mailbox.json', 'utf8'));
+          const stable = JSON.stringify({
+            schema_version: c?.schema_version,
+            request_id: c?.request_id,
+            action: c?.action,
+            payload: c?.payload ?? null
+          });
+          process.stdout.write(crypto.createHash('sha256').update(stable).digest('hex'));
+          NODE
+          )"
+
           matched=false
           for attempt in 1 2 3 4 5 6 7; do
             retry_get /mailbox/status evidence/mailbox-status.json
-            if EXPECTED_ID="$expected_id" python - <<'PY'
+            if EXPECTED_ID="$expected_id" EXPECTED_FP="$expected_fingerprint" EXPECTED_ISSUED_AT="$expected_issued_at" python - <<'PY'
           import json, os
+          from datetime import datetime
           from pathlib import Path
+
+          def dt(value):
+              if not value:
+                  return None
+              return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+
           m = json.loads(Path('evidence/mailbox-status.json').read_text())
-          expected = os.environ.get('EXPECTED_ID', '')
-          ids = {str((m.get('receipt') or {}).get('request_id', ''))}
-          ids.update(str(x.get('request_id', '')) for x in (m.get('recent_ledger') or []))
-          raise SystemExit(0 if expected and expected in ids else 1)
+          expected_id = os.environ.get('EXPECTED_ID', '')
+          expected_fp = os.environ.get('EXPECTED_FP', '')
+          issued_at = dt(os.environ.get('EXPECTED_ISSUED_AT', ''))
+
+          ledger = {str(x.get('request_id', '')): x for x in (m.get('recent_ledger') or [])}
+          entry = ledger.get(expected_id)
+          poll = m.get('last_poll') or {}
+          receipt = m.get('receipt') or {}
+
+          if not expected_id or not expected_fp or not entry:
+              raise SystemExit(1)
+          if str(poll.get('request_id', '')) != expected_id:
+              raise SystemExit(1)
+          poll_finished = dt(poll.get('finished_at'))
+          if issued_at and (not poll_finished or poll_finished < issued_at):
+              raise SystemExit(1)
+
+          ledger_fp = str(entry.get('fingerprint', ''))
+          if ledger_fp == expected_fp:
+              # If the retained execution predates this mailbox issuance, this
+              # observation must be a DUPLICATE, not merely an old ledger hit.
+              started_at = dt(entry.get('started_at'))
+              if issued_at and started_at and started_at < issued_at:
+                  ok = poll.get('receipt_status') == 'DUPLICATE'
+              else:
+                  ok = poll.get('receipt_status') in ('COMPLETED', 'DUPLICATE')
+          else:
+              # Reusing an existing request_id with a different command must
+              # produce an explicit collision receipt for the new fingerprint.
+              ok = (
+                  poll.get('receipt_status') == 'REJECTED'
+                  and receipt.get('request_id') == expected_id
+                  and receipt.get('status') == 'REJECTED'
+                  and receipt.get('error') == 'REQUEST_ID_COLLISION'
+                  and str(receipt.get('expected_fingerprint', '')) == ledger_fp
+                  and str(receipt.get('received_fingerprint', '')) == expected_fp
+              )
+
+          raise SystemExit(0 if ok else 1)
           PY
             then
               matched=true
@@ -112,7 +170,8 @@ jobs:
           print(json.dumps(report, indent=2))
           PY
 
-          printf '{"expected_request_id":"%s","matched":%s}\n' "$expected_id" "$matched" > evidence/mailbox-wait.json
+          printf '{"expected_request_id":"%s","expected_fingerprint":"%s","expected_issued_at":"%s","matched":%s}\n' \
+            "$expected_id" "$expected_fingerprint" "$expected_issued_at" "$matched" > evidence/mailbox-wait.json
           test "$matched" = true
 
       - name: Upload evidence
