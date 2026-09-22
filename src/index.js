@@ -6,14 +6,6 @@ const MAILBOX_URL = "https://raw.githubusercontent.com/amzsdq/RCloud/main/contro
 export class RuntimeState extends DurableObject {
   constructor(ctx, env) { super(ctx, env); }
   async getState() { return (await this.ctx.storage.get("state")) ?? { value: "UNINITIALIZED", updated_at: null }; }
-  async setState(value) { const state = { value, updated_at: new Date().toISOString() }; await this.ctx.storage.put("state", state); return state; }
-
-  async armAlarm(seconds = 120) {
-    const safeSeconds = clampSeconds(seconds), fireAt = Date.now() + safeSeconds * 1000;
-    await this.ctx.storage.setAlarm(fireAt);
-    const state = { value: "ALARM_ARMED", updated_at: new Date().toISOString(), alarm_fire_at: new Date(fireAt).toISOString(), alarm_interval_seconds: safeSeconds, loop_enabled: false };
-    await this.ctx.storage.put("state", state); return { state, alarm_time_ms: fireAt };
-  }
 
   async startLoop(seconds = 120) {
     const safeSeconds = clampSeconds(seconds), fireAt = Date.now() + safeSeconds * 1000;
@@ -27,8 +19,7 @@ export class RuntimeState extends DurableObject {
   async ensureLoop(seconds = 120) {
     const autoboot = await this.ctx.storage.get("autoboot_enabled");
     if (autoboot === false) return { ok: true, action: "DISABLED", reason: "AUTOBOOT_DISABLED" };
-    const safeSeconds = clampSeconds(seconds);
-    const config = (await this.ctx.storage.get("loop_config")) ?? { enabled: false, interval_seconds: safeSeconds };
+    const safeSeconds = clampSeconds(seconds), config = (await this.ctx.storage.get("loop_config")) ?? { enabled: false, interval_seconds: safeSeconds };
     const alarmTime = await this.ctx.storage.getAlarm(), count = (await this.ctx.storage.get("loop_count")) ?? 0;
     if (config.enabled && alarmTime != null) return { ok: true, action: "ALREADY_RUNNING", loop_count: count, alarm_time_ms: alarmTime, alarm_fire_at: new Date(alarmTime).toISOString() };
     const interval = config.enabled && config.interval_seconds ? Number(config.interval_seconds) : safeSeconds, fireAt = Date.now() + interval * 1000;
@@ -40,36 +31,29 @@ export class RuntimeState extends DurableObject {
 
   async stopLoop() {
     await this.ctx.storage.put("autoboot_enabled", false); await this.ctx.storage.put("loop_config", { enabled: false, interval_seconds: null }); await this.ctx.storage.deleteAlarm();
-    const previous = (await this.ctx.storage.get("state")) ?? {};
-    const state = { ...previous, value: "LOOP_STOPPED", updated_at: new Date().toISOString(), loop_enabled: false, autoboot_enabled: false, alarm_fire_at: null };
+    const previous = (await this.ctx.storage.get("state")) ?? {}, state = { ...previous, value: "LOOP_STOPPED", updated_at: new Date().toISOString(), loop_enabled: false, autoboot_enabled: false, alarm_fire_at: null };
     await this.ctx.storage.put("state", state); return state;
   }
 
   async getLoopStatus() {
-    const state = await this.getState(); const config = (await this.ctx.storage.get("loop_config")) ?? { enabled: false, interval_seconds: null };
+    const state = await this.getState(), config = (await this.ctx.storage.get("loop_config")) ?? { enabled: false, interval_seconds: null };
     const alarmTime = await this.ctx.storage.getAlarm(), count = (await this.ctx.storage.get("loop_count")) ?? 0, evidence = (await this.ctx.storage.get("loop_evidence")) ?? [];
     return { state, config, autoboot_enabled: (await this.ctx.storage.get("autoboot_enabled")) !== false, loop_count: count, verified_two_plus_fires: evidence.length >= 2, recent_alarm_fires: evidence, alarm_time_ms: alarmTime, alarm_fire_at: alarmTime == null ? null : new Date(alarmTime).toISOString() };
   }
 
-  async getAlarmStatus() { const alarmTime = await this.ctx.storage.getAlarm(); return { alarm_time_ms: alarmTime, alarm_fire_at: alarmTime == null ? null : new Date(alarmTime).toISOString() }; }
-
   async processMailbox(command) {
     if (!command || command.schema_version !== 1 || typeof command.request_id !== "string" || !command.request_id) {
-      const receipt = { ok: false, status: "REJECTED", error: "INVALID_COMMAND", processed_at: new Date().toISOString() };
-      await this.ctx.storage.put("mailbox_receipt", receipt); return receipt;
+      const receipt = { ok: false, status: "REJECTED", error: "INVALID_COMMAND", processed_at: new Date().toISOString() }; await this.ctx.storage.put("mailbox_receipt", receipt); return receipt;
     }
     const lastRequestId = await this.ctx.storage.get("mailbox_last_request_id");
-    if (lastRequestId === command.request_id) {
-      const previous = await this.ctx.storage.get("mailbox_receipt");
-      return { ...(previous ?? {}), ok: true, status: "DUPLICATE", duplicate: true };
-    }
-    let result;
+    if (lastRequestId === command.request_id) { const previous = await this.ctx.storage.get("mailbox_receipt"); return { ...(previous ?? {}), ok: true, status: "DUPLICATE", duplicate: true }; }
+    let accepted = true, result;
     if (command.action === "NOOP") result = { acknowledged: true };
-    else result = { error: "UNSUPPORTED_ACTION" };
-    const accepted = command.action === "NOOP";
+    else if (command.action === "START_LOOP") result = await this.startLoop(command.payload?.seconds ?? 120);
+    else if (command.action === "STOP_LOOP") result = await this.stopLoop();
+    else { accepted = false; result = { error: "UNSUPPORTED_ACTION" }; }
     const receipt = { ok: accepted, status: accepted ? "COMPLETED" : "REJECTED", request_id: command.request_id, action: command.action, processed_at: new Date().toISOString(), result };
-    await this.ctx.storage.put("mailbox_last_request_id", command.request_id); await this.ctx.storage.put("mailbox_receipt", receipt);
-    return receipt;
+    await this.ctx.storage.put("mailbox_last_request_id", command.request_id); await this.ctx.storage.put("mailbox_receipt", receipt); return receipt;
   }
 
   async getMailboxStatus() { return { last_request_id: (await this.ctx.storage.get("mailbox_last_request_id")) ?? null, receipt: (await this.ctx.storage.get("mailbox_receipt")) ?? null }; }
@@ -85,30 +69,18 @@ export class RuntimeState extends DurableObject {
 }
 
 async function pollMailbox(runtime) {
-  try {
-    const response = await fetch(MAILBOX_URL, { headers: { "user-agent": "RCloud/0.6" } });
-    if (!response.ok) return { ok: false, status: "FETCH_FAILED", http_status: response.status };
-    return await runtime.processMailbox(await response.json());
-  } catch (error) { return { ok: false, status: "FETCH_ERROR", error: String(error) }; }
+  try { const response = await fetch(MAILBOX_URL, { headers: { "user-agent": "RCloud/0.7" } }); if (!response.ok) return { ok: false, status: "FETCH_FAILED", http_status: response.status }; return await runtime.processMailbox(await response.json()); }
+  catch (error) { return { ok: false, status: "FETCH_ERROR", error: String(error) }; }
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url), runtime = env.RUNTIME_STATE.getByName("main");
-    if (url.pathname === "/health") return Response.json({ ok: true, service: "RCloud", version: "0.6.0", runtime: "cloudflare-worker+durable-object+alarm+cron+github-mailbox", time: new Date().toISOString() });
+    if (url.pathname === "/health") return Response.json({ ok: true, service: "RCloud", version: "0.7.0", runtime: "cloudflare-worker+durable-object+alarm+cron+github-mailbox", control_plane: "github-main", time: new Date().toISOString() });
     if (url.pathname === "/state") return Response.json({ ok: true, state: await runtime.getState() });
-    if (url.pathname === "/state/set") { const value = url.searchParams.get("value"); if (!value) return Response.json({ ok: false, error: "Missing ?value=" }, { status: 400 }); return Response.json({ ok: true, state: await runtime.setState(value) }); }
-    if (url.pathname === "/alarm/arm") return Response.json({ ok: true, ...(await runtime.armAlarm(url.searchParams.get("seconds") ?? "120")) });
-    if (url.pathname === "/alarm/status") return Response.json({ ok: true, ...(await runtime.getAlarmStatus()) });
-    if (url.pathname === "/loop/start") return Response.json({ ok: true, ...(await runtime.startLoop(url.searchParams.get("seconds") ?? "120")) });
-    if (url.pathname === "/loop/ensure") return Response.json({ ok: true, ...(await runtime.ensureLoop(url.searchParams.get("seconds") ?? "120")) });
-    if (url.pathname === "/loop/stop") return Response.json({ ok: true, state: await runtime.stopLoop() });
     if (url.pathname === "/loop/status") return Response.json({ ok: true, ...(await runtime.getLoopStatus()) });
     if (url.pathname === "/mailbox/status") return Response.json({ ok: true, ...(await runtime.getMailboxStatus()) });
-    return new Response("RCloud is alive. Try /health, /state, /loop/status, or /mailbox/status", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+    return new Response("RCloud read-only API. Try /health, /state, /loop/status, or /mailbox/status", { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
   },
-  async scheduled(controller, env, ctx) {
-    const runtime = env.RUNTIME_STATE.getByName("main");
-    ctx.waitUntil(Promise.all([runtime.ensureLoop(120), pollMailbox(runtime)]));
-  }
+  async scheduled(controller, env, ctx) { const runtime = env.RUNTIME_STATE.getByName("main"); ctx.waitUntil(Promise.all([runtime.ensureLoop(120), pollMailbox(runtime)])); }
 };
