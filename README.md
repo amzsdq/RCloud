@@ -52,9 +52,16 @@ Before credentialed or irreversible executors are added, recovery of stale `PROC
 
 Repository state proves only what was committed. Runtime capabilities are promoted to PASS only from deployed runtime evidence. In particular, a commit containing an executor is not proof that Cloudflare deployed it or that the executor ran.
 
-Previously verified manually: Worker health, Durable Object persistence across redeploy, and one-shot Durable Object alarm execution. The runtime records up to 20 alarm firings so repeated self-rescheduling can be verified without relying on browser timing. GitHub mailbox control, durable non-consecutive idempotency, collision rejection, retry evidence, repeated self-loop execution, and Workers AI execution remain canary/pending until deployed runtime evidence confirms them.
+Verified runtime evidence:
 
-Current AI canary: `AI-CANARY-001` requests the exact response `RCLOUD_AI_ALIVE`. Promotion requires a deployed `/mailbox/status` receipt proving execution; repository code or a successful commit alone is not sufficient evidence.
+- Worker health: PASS (manual earlier verification; external probe also reached deployed v0.11.0).
+- Durable Object persistence across redeploy: PASS (manual earlier verification).
+- one-shot Durable Object alarm: PASS (manual earlier verification).
+- repeated self-rescheduling loop: **PASS** — external probe run `35713529719` observed `loop_count=16`, 14 retained consecutive alarm-fire records, `verified_two_plus_fires=true`, and a next alarm scheduled for 2026-09-22T10:01:15.388Z.
+- GitHub mailbox → Cloudflare cron poll → Workers AI → durable receipt: **PASS** — the same external probe observed `AI-CANARY-001` completed with `RCLOUD_AI_ALIVE`, model `@cf/zai-org/glm-4.7-flash`, and a durable terminal ledger entry.
+- repeated same-ID suppression: **PASS for consecutive polling** — poll history repeatedly returned `DUPLICATE` for the same AI canary without another execution while the same deployed ledger was active.
+
+Still pending dedicated deployed canaries: non-consecutive `A → B → A` suppression on v0.11, same-ID/different-fingerprint collision rejection, stale `PROCESSING` reconciliation, and forced mailbox-fetch retry/failure behavior.
 
 ### Independent external probe
 
