@@ -1,0 +1,60 @@
+name: queue-evidence
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/queue.js'
+      - 'src/worker.js'
+      - 'wrangler.jsonc'
+      - 'control/queue-index.json'
+      - 'control/requests/**'
+      - '.github/workflows/queue-evidence.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rcloud-queue-evidence
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wait for queue-capable deployed runtime
+        env:
+          BASE_URL: https://rcloud.amzsdq.workers.dev
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          matched=false
+          for attempt in $(seq 1 18); do
+            if curl --fail --silent --show-error --connect-timeout 10 --max-time 20 -H 'cache-control: no-cache' "$BASE_URL/health?cb=$GITHUB_RUN_ID-$attempt" -o evidence/health.json \
+              && curl --fail --silent --show-error --connect-timeout 10 --max-time 20 -H 'cache-control: no-cache' "$BASE_URL/queue/status?cb=$GITHUB_RUN_ID-$attempt" -o evidence/queue-status.json \
+              && python - <<'PY'
+          import json
+          h=json.load(open('evidence/health.json'))
+          q=json.load(open('evidence/queue-status.json'))
+          ok = h.get('ok') is True and h.get('version') == '0.13.0' and q.get('ok') is True and q.get('version') == '0.13.0'
+          raise SystemExit(0 if ok else 1)
+          PY
+            then
+              matched=true
+              break
+            fi
+            sleep 10
+          done
+          test "$matched" = true
+          cat evidence/health.json
+          cat evidence/queue-status.json
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: queue-evidence-${{ github.run_id }}
+          path: evidence/
+          retention-days: 7
