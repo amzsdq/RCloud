@@ -98,6 +98,15 @@ jobs:
           poll_finished = dt(poll.get('finished_at'))
           if issued_at and (not poll_finished or poll_finished < issued_at):
               raise SystemExit(1)
+          # v0.12.2+ records the exact command identity observed by the Worker.
+          # Require it when available so stale CDN reads cannot masquerade as
+          # evidence for the trigger commit.
+          observed_issued = poll.get('command_issued_at')
+          observed_fp = poll.get('observed_fingerprint')
+          if observed_issued is not None and str(observed_issued) != os.environ.get('EXPECTED_ISSUED_AT', ''):
+              raise SystemExit(1)
+          if observed_fp is not None and str(observed_fp) != expected_fp:
+              raise SystemExit(1)
 
           ledger_fp = str(entry.get('fingerprint', ''))
           if ledger_fp == expected_fp:
