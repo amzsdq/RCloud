@@ -22,12 +22,13 @@ concurrency:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 4
     steps:
       - name: Probe deployed read-only runtime
         shell: bash
         env:
           BASE_URL: https://rcloud.amzsdq.workers.dev
+          RAW_MAILBOX: https://raw.githubusercontent.com/amzsdq/RCloud/main/control/mailbox.json
         run: |
           set -euo pipefail
           mkdir -p evidence
@@ -46,7 +47,29 @@ jobs:
 
           retry_get /health evidence/health.json
           retry_get /loop/status evidence/loop-status.json
-          retry_get /mailbox/status evidence/mailbox-status.json
+
+          # For mailbox-changing pushes, wait until the deployed cron has observed
+          # the current mailbox request. This converts a race-prone snapshot into
+          # durable execution evidence without exposing a mutating HTTP endpoint.
+          expected_id="$(curl --fail --silent --show-error -H 'cache-control: no-cache' "$RAW_MAILBOX" | python -c 'import json,sys; print(json.load(sys.stdin).get("request_id", ""))')"
+          matched=false
+          for attempt in 1 2 3 4 5 6 7; do
+            retry_get /mailbox/status evidence/mailbox-status.json
+            if EXPECTED_ID="$expected_id" python - <<'PY'
+          import json, os
+          from pathlib import Path
+          m = json.loads(Path('evidence/mailbox-status.json').read_text())
+          expected = os.environ.get('EXPECTED_ID', '')
+          ids = {str((m.get('receipt') or {}).get('request_id', ''))}
+          ids.update(str(x.get('request_id', '')) for x in (m.get('recent_ledger') or []))
+          raise SystemExit(0 if expected and expected in ids else 1)
+          PY
+            then
+              matched=true
+              break
+            fi
+            sleep 10
+          done
 
           python - <<'PY'
           import json
@@ -87,10 +110,10 @@ jobs:
           }
           Path('evidence/summary.json').write_text(json.dumps(report, indent=2) + '\n')
           print(json.dumps(report, indent=2))
-
-          # Reachability is the hard probe requirement. Feature canaries remain
-          # evidence fields rather than failing the workflow while rollout is pending.
           PY
+
+          printf '{"expected_request_id":"%s","matched":%s}\n' "$expected_id" "$matched" > evidence/mailbox-wait.json
+          test "$matched" = true
 
       - name: Upload evidence
         if: always()
