@@ -42,7 +42,7 @@ jobs:
               m=json.loads(Path('evidence/mailbox-status.json').read_text())
           except Exception:
               raise SystemExit(1)
-          if h.get('version') != '0.14.0':
+          if h.get('version') != '0.14.1':
               raise SystemExit(1)
           rid=os.environ['EXPECTED_ID']
           receipts=list(m.get('recent_receipts') or [])
