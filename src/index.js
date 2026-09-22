@@ -3,6 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const clampSeconds = (value, fallback = 120) => Math.max(5, Math.min(Number(value) || fallback, 3600));
 const MAILBOX_URL = "https://raw.githubusercontent.com/amzsdq/RCloud/main/control/mailbox.json";
 const AI_MODEL = "@cf/zai-org/glm-4.7-flash";
+const LEDGER_LIMIT = 100;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const stableCommand = command => JSON.stringify({ schema_version: command?.schema_version, request_id: command?.request_id, action: command?.action, payload: command?.payload ?? null });
 async function sha256(text) { const bytes = new TextEncoder().encode(text); const digest = await crypto.subtle.digest("SHA-256", bytes); return [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, "0")).join(""); }
@@ -57,28 +58,49 @@ export class RuntimeState extends DurableObject {
     const history = (await this.ctx.storage.get("receipt_history")) ?? []; history.push(receipt); while (history.length > 20) history.shift(); await this.ctx.storage.put("receipt_history", history);
   }
 
+  async getLedger() { return (await this.ctx.storage.get("request_ledger")) ?? {}; }
+  async putLedgerEntry(requestId, entry) {
+    const ledger = await this.getLedger(); ledger[requestId] = entry;
+    const ids = Object.keys(ledger).sort((a, b) => String(ledger[a]?.updated_at ?? "").localeCompare(String(ledger[b]?.updated_at ?? "")));
+    while (ids.length > LEDGER_LIMIT) { const oldest = ids.shift(); if (ledger[oldest]?.status === "PROCESSING") { ids.push(oldest); if (ids.every(id => ledger[id]?.status === "PROCESSING")) break; } else delete ledger[oldest]; }
+    await this.ctx.storage.put("request_ledger", ledger);
+  }
+
   async processMailbox(command) {
     if (!command || command.schema_version !== 1 || typeof command.request_id !== "string" || !command.request_id) {
       const receipt = { ok: false, status: "REJECTED", error: "INVALID_COMMAND", processed_at: new Date().toISOString() }; await this.saveReceipt(receipt); return receipt;
     }
-    const fingerprint = await sha256(stableCommand(command));
-    const lastRequestId = await this.ctx.storage.get("mailbox_last_request_id"), lastFingerprint = await this.ctx.storage.get("mailbox_last_fingerprint");
-    if (lastRequestId === command.request_id) {
-      if (lastFingerprint && lastFingerprint !== fingerprint) { const conflict = { ok: false, status: "REJECTED", error: "REQUEST_ID_COLLISION", request_id: command.request_id, processed_at: new Date().toISOString(), expected_fingerprint: lastFingerprint, received_fingerprint: fingerprint }; await this.saveReceipt(conflict); return conflict; }
-      const previous = await this.ctx.storage.get("mailbox_receipt"); return { ...(previous ?? {}), ok: true, status: "DUPLICATE", duplicate: true, fingerprint };
+    const fingerprint = await sha256(stableCommand(command)), ledger = await this.getLedger(), existing = ledger[command.request_id];
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) { const conflict = { ok: false, status: "REJECTED", error: "REQUEST_ID_COLLISION", request_id: command.request_id, processed_at: new Date().toISOString(), expected_fingerprint: existing.fingerprint, received_fingerprint: fingerprint }; await this.saveReceipt(conflict); return conflict; }
+      if (existing.status === "PROCESSING") { const held = { ok: false, status: "PROCESSING", duplicate: true, retry_suppressed: true, request_id: command.request_id, fingerprint, started_at: existing.started_at, processed_at: new Date().toISOString() }; await this.saveReceipt(held); return held; }
+      return { ...(existing.receipt ?? {}), status: "DUPLICATE", duplicate: true, fingerprint, original_status: existing.status };
     }
+
+    const startedAt = new Date().toISOString();
+    await this.putLedgerEntry(command.request_id, { fingerprint, action: command.action, status: "PROCESSING", started_at: startedAt, updated_at: startedAt });
     let accepted = true, result;
-    if (command.action === "NOOP") result = { acknowledged: true };
-    else if (command.action === "START_LOOP") result = await this.startLoop(command.payload?.seconds ?? 120);
-    else if (command.action === "STOP_LOOP") result = await this.stopLoop();
-    else if (command.action === "AI_PROMPT") { result = await this.runAI(command.payload); accepted = result.ok === true; }
-    else { accepted = false; result = { error: "UNSUPPORTED_ACTION" }; }
-    const receipt = { ok: accepted, status: accepted ? "COMPLETED" : "REJECTED", request_id: command.request_id, fingerprint, action: command.action, processed_at: new Date().toISOString(), result };
-    await this.ctx.storage.put("mailbox_last_request_id", command.request_id); await this.ctx.storage.put("mailbox_last_fingerprint", fingerprint); await this.saveReceipt(receipt); return receipt;
+    try {
+      if (command.action === "NOOP") result = { acknowledged: true };
+      else if (command.action === "START_LOOP") result = await this.startLoop(command.payload?.seconds ?? 120);
+      else if (command.action === "STOP_LOOP") result = await this.stopLoop();
+      else if (command.action === "AI_PROMPT") { result = await this.runAI(command.payload); accepted = result.ok === true; }
+      else { accepted = false; result = { error: "UNSUPPORTED_ACTION" }; }
+      const receipt = { ok: accepted, status: accepted ? "COMPLETED" : "REJECTED", request_id: command.request_id, fingerprint, action: command.action, started_at: startedAt, processed_at: new Date().toISOString(), result };
+      await this.putLedgerEntry(command.request_id, { fingerprint, action: command.action, status: receipt.status, started_at: startedAt, updated_at: receipt.processed_at, receipt });
+      await this.saveReceipt(receipt); return receipt;
+    } catch (error) {
+      const receipt = { ok: false, status: "FAILED_AMBIGUOUS", request_id: command.request_id, fingerprint, action: command.action, started_at: startedAt, processed_at: new Date().toISOString(), error: String(error), automatic_retry: false };
+      await this.putLedgerEntry(command.request_id, { fingerprint, action: command.action, status: "FAILED_AMBIGUOUS", started_at: startedAt, updated_at: receipt.processed_at, receipt });
+      await this.saveReceipt(receipt); return receipt;
+    }
   }
 
   async recordPoll(observation) { const history = (await this.ctx.storage.get("poll_history")) ?? []; history.push(observation); while (history.length > 20) history.shift(); await this.ctx.storage.put("poll_history", history); await this.ctx.storage.put("last_poll", observation); }
-  async getMailboxStatus() { return { last_request_id: (await this.ctx.storage.get("mailbox_last_request_id")) ?? null, last_fingerprint: (await this.ctx.storage.get("mailbox_last_fingerprint")) ?? null, receipt: (await this.ctx.storage.get("mailbox_receipt")) ?? null, recent_receipts: (await this.ctx.storage.get("receipt_history")) ?? [], last_ai_result: (await this.ctx.storage.get("last_ai_result")) ?? null, last_poll: (await this.ctx.storage.get("last_poll")) ?? null, recent_polls: (await this.ctx.storage.get("poll_history")) ?? [] }; }
+  async getMailboxStatus() {
+    const ledger = await this.getLedger(); const ledgerEntries = Object.entries(ledger).map(([request_id, v]) => ({ request_id, fingerprint: v.fingerprint, action: v.action, status: v.status, started_at: v.started_at, updated_at: v.updated_at })).sort((a,b) => String(b.updated_at).localeCompare(String(a.updated_at))).slice(0,20);
+    return { receipt: (await this.ctx.storage.get("mailbox_receipt")) ?? null, recent_receipts: (await this.ctx.storage.get("receipt_history")) ?? [], ledger_size: Object.keys(ledger).length, recent_ledger: ledgerEntries, last_ai_result: (await this.ctx.storage.get("last_ai_result")) ?? null, last_poll: (await this.ctx.storage.get("last_poll")) ?? null, recent_polls: (await this.ctx.storage.get("poll_history")) ?? [] };
+  }
 
   async alarm() {
     const previous = (await this.ctx.storage.get("state")) ?? {}, config = (await this.ctx.storage.get("loop_config")) ?? { enabled: false, interval_seconds: null };
@@ -94,7 +116,7 @@ async function pollMailbox(runtime) {
   const startedAt = new Date().toISOString(); let lastError = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const response = await fetch(MAILBOX_URL, { headers: { "user-agent": "RCloud/0.10", "cache-control": "no-cache" } }); if (!response.ok) throw new Error(`HTTP_${response.status}`);
+      const response = await fetch(MAILBOX_URL, { headers: { "user-agent": "RCloud/0.11", "cache-control": "no-cache" } }); if (!response.ok) throw new Error(`HTTP_${response.status}`);
       const receipt = await runtime.processMailbox(await response.json()); const observation = { ok: true, status: "POLL_OK", attempt, started_at: startedAt, finished_at: new Date().toISOString(), request_id: receipt.request_id ?? null, receipt_status: receipt.status };
       await runtime.recordPoll(observation); return observation;
     } catch (error) { lastError = String(error); if (attempt < 3) await sleep(250 * (2 ** (attempt - 1))); }
@@ -105,7 +127,7 @@ async function pollMailbox(runtime) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url), runtime = env.RUNTIME_STATE.getByName("main");
-    if (url.pathname === "/health") return Response.json({ ok: true, service: "RCloud", version: "0.10.0", runtime: "cloudflare-worker+durable-object+alarm+cron+github-mailbox+workers-ai", control_plane: "github-main", ai_model: AI_MODEL, time: new Date().toISOString() });
+    if (url.pathname === "/health") return Response.json({ ok: true, service: "RCloud", version: "0.11.0", runtime: "cloudflare-worker+durable-object+alarm+cron+github-mailbox+workers-ai+request-ledger", control_plane: "github-main", ai_model: AI_MODEL, time: new Date().toISOString() });
     if (url.pathname === "/state") return Response.json({ ok: true, state: await runtime.getState() });
     if (url.pathname === "/loop/status") return Response.json({ ok: true, ...(await runtime.getLoopStatus()) });
     if (url.pathname === "/mailbox/status") return Response.json({ ok: true, ...(await runtime.getMailboxStatus()) });
