@@ -3,6 +3,7 @@ import { launch, connect } from "@cloudflare/playwright";
 
 const clampSeconds = (value, fallback = 120) => Math.max(5, Math.min(Number(value) || fallback, 3600));
 const MAILBOX_URL = "https://raw.githubusercontent.com/amzsdq/RCloud/main/control/mailbox.json";
+const MAILBOX_API_URL = "https://api.github.com/repos/amzsdq/RCloud/contents/control/mailbox.json?ref=main";
 const AI_MODEL = "@cf/zai-org/glm-4.7-flash";
 const LEDGER_LIMIT = 100;
 const PROCESSING_STALE_MS = 5 * 60 * 1000;
@@ -260,15 +261,43 @@ export class RuntimeState extends DurableObject {
   }
 }
 
+async function fetchFreshMailbox() {
+  const apiResponse = await fetch(`${MAILBOX_API_URL}&cb=${Date.now()}`, {
+    headers: {
+      "accept": "application/vnd.github+json",
+      "user-agent": "RCloud/0.14.1",
+      "cache-control": "no-cache"
+    }
+  });
+  if (apiResponse.ok) {
+    const envelope = await apiResponse.json();
+    if (typeof envelope?.content === "string" && envelope.content) {
+      const compact = envelope.content.replace(/\\s/g, "");
+      const bytes = Uint8Array.from(atob(compact), ch => ch.charCodeAt(0));
+      return {
+        command: JSON.parse(new TextDecoder().decode(bytes)),
+        source: "github-contents-api",
+        source_sha: envelope.sha ?? null
+      };
+    }
+  }
+
+  const rawResponse = await fetch(`${MAILBOX_URL}?cb=${Date.now()}`, {
+    headers: { "user-agent": "RCloud/0.14.1", "cache-control": "no-store" }
+  });
+  if (!rawResponse.ok) throw new Error(`MAILBOX_FETCH_FAILED_API_${apiResponse.status}_RAW_${rawResponse.status}`);
+  return { command: await rawResponse.json(), source: "raw-main-fallback", source_sha: null };
+}
+
 async function pollMailbox(runtime) {
   const startedAt = new Date().toISOString(); let lastError = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const mailboxUrl = `${MAILBOX_URL}?cb=${Date.now()}`; const response = await fetch(mailboxUrl, { headers: { "user-agent": "RCloud/0.12.2", "cache-control": "no-store" } }); if (!response.ok) throw new Error(`HTTP_${response.status}`);
-      const command = await response.json();
+      const fetched = await fetchFreshMailbox();
+      const command = fetched.command;
       const receipt = await runtime.processMailbox(command);
       const observedFingerprint = receipt.received_fingerprint ?? receipt.fingerprint ?? null;
-      const observation = { ok: true, status: "POLL_OK", attempt, started_at: startedAt, finished_at: new Date().toISOString(), request_id: receipt.request_id ?? null, receipt_status: receipt.status, command_issued_at: command?.issued_at ?? null, observed_fingerprint: observedFingerprint };
+      const observation = { ok: true, status: "POLL_OK", attempt, started_at: startedAt, finished_at: new Date().toISOString(), request_id: receipt.request_id ?? null, receipt_status: receipt.status, command_issued_at: command?.issued_at ?? null, observed_fingerprint: observedFingerprint, mailbox_source: fetched.source, mailbox_source_sha: fetched.source_sha };
       await runtime.recordPoll(observation); return observation;
     } catch (error) { lastError = String(error); if (attempt < 3) await sleep(250 * (2 ** (attempt - 1))); }
   }
