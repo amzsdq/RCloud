@@ -21,6 +21,54 @@ export class RuntimeState extends DurableObject {
     await this.ctx.storage.put("state", state);
     return state;
   }
+
+  async armAlarm(seconds = 120) {
+    const safeSeconds = Math.max(5, Math.min(Number(seconds) || 120, 3600));
+    const fireAt = Date.now() + safeSeconds * 1000;
+
+    await this.ctx.storage.setAlarm(fireAt);
+
+    const state = {
+      value: "ALARM_ARMED",
+      updated_at: new Date().toISOString(),
+      alarm_fire_at: new Date(fireAt).toISOString()
+    };
+
+    await this.ctx.storage.put("state", state);
+
+    return {
+      state,
+      alarm_time_ms: fireAt
+    };
+  }
+
+  async getAlarmStatus() {
+    const alarmTime = await this.ctx.storage.getAlarm();
+
+    return {
+      alarm_time_ms: alarmTime,
+      alarm_fire_at:
+        alarmTime == null
+          ? null
+          : new Date(alarmTime).toISOString()
+    };
+  }
+
+  async alarm() {
+    const previous =
+      (await this.ctx.storage.get("state")) ?? {};
+
+    const firedAt = new Date().toISOString();
+
+    const state = {
+      ...previous,
+      value: "CLOUD_TAKEOVER",
+      updated_at: firedAt,
+      alarm_fired_at: firedAt
+    };
+
+    await this.ctx.storage.put("state", state);
+  }
 }
 
 export default {
@@ -32,8 +80,8 @@ export default {
       return Response.json({
         ok: true,
         service: "RCloud",
-        version: "0.2.1",
-        runtime: "cloudflare-worker+durable-object",
+        version: "0.3.0",
+        runtime: "cloudflare-worker+durable-object+alarm",
         time: new Date().toISOString()
       });
     }
@@ -68,8 +116,27 @@ export default {
       });
     }
 
+    if (url.pathname === "/alarm/arm") {
+      const seconds = url.searchParams.get("seconds") ?? "120";
+      const result = await runtime.armAlarm(seconds);
+
+      return Response.json({
+        ok: true,
+        ...result
+      });
+    }
+
+    if (url.pathname === "/alarm/status") {
+      const result = await runtime.getAlarmStatus();
+
+      return Response.json({
+        ok: true,
+        ...result
+      });
+    }
+
     return new Response(
-      "RCloud is alive. Try /health, /state, or /state/set?value=TEST",
+      "RCloud is alive. Try /health, /state, /alarm/arm?seconds=120, or /alarm/status",
       {
         status: 200,
         headers: {
