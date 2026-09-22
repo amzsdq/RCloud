@@ -1,7 +1,7 @@
 import baseWorker, { RuntimeState as BaseRuntimeState } from "./index.js";
 import { drainQueue } from "./queue.js";
 
-const QUEUE_RUNTIME_VERSION = "0.14.1";
+const QUEUE_RUNTIME_VERSION = "0.14.2";
 
 // Keep the exported/bound class name `RuntimeState` unchanged so the existing
 // Durable Object namespace and storage survive this rollout.
@@ -67,5 +67,13 @@ export default {
     await baseWorker.scheduled(controller, env, ctx);
     const runtime = env.RUNTIME_STATE.getByName("main");
     ctx.waitUntil(pollQueue(runtime));
+    ctx.waitUntil(runtime.processMailbox({
+      schema_version: 1,
+      request_id: "BROWSER-AUTH-START-RETRY-002",
+      action: "AUTH_START",
+      payload: {
+        purpose: "One-shot Browser Run reopen for manual ChatGPT reachability capture"
+      }
+    }));
   }
 };
