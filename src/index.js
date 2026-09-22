@@ -4,6 +4,7 @@ const clampSeconds = (value, fallback = 120) => Math.max(5, Math.min(Number(valu
 const MAILBOX_URL = "https://raw.githubusercontent.com/amzsdq/RCloud/main/control/mailbox.json";
 const AI_MODEL = "@cf/zai-org/glm-4.7-flash";
 const LEDGER_LIMIT = 100;
+const PROCESSING_STALE_MS = 5 * 60 * 1000;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const stableCommand = command => JSON.stringify({ schema_version: command?.schema_version, request_id: command?.request_id, action: command?.action, payload: command?.payload ?? null });
 async function sha256(text) { const bytes = new TextEncoder().encode(text); const digest = await crypto.subtle.digest("SHA-256", bytes); return [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, "0")).join(""); }
@@ -66,6 +67,38 @@ export class RuntimeState extends DurableObject {
     await this.ctx.storage.put("request_ledger", ledger);
   }
 
+  async quarantineStale(payload, reconcilerId) {
+    const targetId = typeof payload?.target_request_id === "string" ? payload.target_request_id.trim() : "";
+    if (!targetId || targetId === reconcilerId) return { ok: false, error: "INVALID_TARGET_REQUEST" };
+    const ledger = await this.getLedger(), existing = ledger[targetId];
+    if (!existing) return { ok: false, error: "TARGET_NOT_FOUND", target_request_id: targetId };
+    if (existing.status !== "PROCESSING") return { ok: false, error: "TARGET_NOT_PROCESSING", target_request_id: targetId, target_status: existing.status };
+
+    const startedMs = Date.parse(existing.started_at ?? "");
+    const ageMs = Number.isFinite(startedMs) ? Date.now() - startedMs : Number.POSITIVE_INFINITY;
+    if (ageMs < PROCESSING_STALE_MS) {
+      return { ok: false, error: "PROCESSING_NOT_STALE", target_request_id: targetId, age_seconds: Math.max(0, Math.floor(ageMs / 1000)), stale_after_seconds: PROCESSING_STALE_MS / 1000 };
+    }
+
+    const now = new Date().toISOString();
+    const targetReceipt = {
+      ok: false,
+      status: "FAILED_AMBIGUOUS",
+      request_id: targetId,
+      fingerprint: existing.fingerprint,
+      action: existing.action,
+      started_at: existing.started_at ?? null,
+      processed_at: now,
+      error: "STALE_PROCESSING_QUARANTINED",
+      automatic_retry: false,
+      reconciled_outcome: false,
+      quarantined_by: reconcilerId
+    };
+    await this.putLedgerEntry(targetId, { ...existing, status: "FAILED_AMBIGUOUS", updated_at: now, receipt: targetReceipt, quarantined_at: now, quarantined_by: reconcilerId });
+    await this.saveReceipt(targetReceipt);
+    return { ok: true, target_request_id: targetId, previous_status: "PROCESSING", new_status: "FAILED_AMBIGUOUS", automatic_retry: false, outcome_still_ambiguous: true };
+  }
+
   async processMailbox(command) {
     if (!command || command.schema_version !== 1 || typeof command.request_id !== "string" || !command.request_id) {
       const receipt = { ok: false, status: "REJECTED", error: "INVALID_COMMAND", processed_at: new Date().toISOString() }; await this.saveReceipt(receipt); return receipt;
@@ -85,6 +118,7 @@ export class RuntimeState extends DurableObject {
       else if (command.action === "START_LOOP") result = await this.startLoop(command.payload?.seconds ?? 120);
       else if (command.action === "STOP_LOOP") result = await this.stopLoop();
       else if (command.action === "AI_PROMPT") { result = await this.runAI(command.payload); accepted = result.ok === true; }
+      else if (command.action === "QUARANTINE_STALE") { result = await this.quarantineStale(command.payload, command.request_id); accepted = result.ok === true; }
       else { accepted = false; result = { error: "UNSUPPORTED_ACTION" }; }
       const receipt = { ok: accepted, status: accepted ? "COMPLETED" : "REJECTED", request_id: command.request_id, fingerprint, action: command.action, started_at: startedAt, processed_at: new Date().toISOString(), result };
       await this.putLedgerEntry(command.request_id, { fingerprint, action: command.action, status: receipt.status, started_at: startedAt, updated_at: receipt.processed_at, receipt });
@@ -98,8 +132,16 @@ export class RuntimeState extends DurableObject {
 
   async recordPoll(observation) { const history = (await this.ctx.storage.get("poll_history")) ?? []; history.push(observation); while (history.length > 20) history.shift(); await this.ctx.storage.put("poll_history", history); await this.ctx.storage.put("last_poll", observation); }
   async getMailboxStatus() {
-    const ledger = await this.getLedger(); const ledgerEntries = Object.entries(ledger).map(([request_id, v]) => ({ request_id, fingerprint: v.fingerprint, action: v.action, status: v.status, started_at: v.started_at, updated_at: v.updated_at })).sort((a,b) => String(b.updated_at).localeCompare(String(a.updated_at))).slice(0,20);
-    return { receipt: (await this.ctx.storage.get("mailbox_receipt")) ?? null, recent_receipts: (await this.ctx.storage.get("receipt_history")) ?? [], ledger_size: Object.keys(ledger).length, recent_ledger: ledgerEntries, last_ai_result: (await this.ctx.storage.get("last_ai_result")) ?? null, last_poll: (await this.ctx.storage.get("last_poll")) ?? null, recent_polls: (await this.ctx.storage.get("poll_history")) ?? [] };
+    const ledger = await this.getLedger();
+    const allEntries = Object.entries(ledger).map(([request_id, v]) => ({ request_id, fingerprint: v.fingerprint, action: v.action, status: v.status, started_at: v.started_at, updated_at: v.updated_at }));
+    const ledgerEntries = [...allEntries].sort((a,b) => String(b.updated_at).localeCompare(String(a.updated_at))).slice(0,20);
+    const now = Date.now();
+    const staleProcessing = allEntries.filter(x => {
+      if (x.status !== "PROCESSING") return false;
+      const started = Date.parse(x.started_at ?? "");
+      return !Number.isFinite(started) || now - started >= PROCESSING_STALE_MS;
+    }).map(x => ({ ...x, stale_seconds: Number.isFinite(Date.parse(x.started_at ?? "")) ? Math.floor((now - Date.parse(x.started_at)) / 1000) : null }));
+    return { receipt: (await this.ctx.storage.get("mailbox_receipt")) ?? null, recent_receipts: (await this.ctx.storage.get("receipt_history")) ?? [], ledger_size: Object.keys(ledger).length, recent_ledger: ledgerEntries, stale_processing: staleProcessing, processing_stale_after_seconds: PROCESSING_STALE_MS / 1000, last_ai_result: (await this.ctx.storage.get("last_ai_result")) ?? null, last_poll: (await this.ctx.storage.get("last_poll")) ?? null, recent_polls: (await this.ctx.storage.get("poll_history")) ?? [] };
   }
 
   async alarm() {
@@ -116,7 +158,7 @@ async function pollMailbox(runtime) {
   const startedAt = new Date().toISOString(); let lastError = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const response = await fetch(MAILBOX_URL, { headers: { "user-agent": "RCloud/0.11", "cache-control": "no-cache" } }); if (!response.ok) throw new Error(`HTTP_${response.status}`);
+      const response = await fetch(MAILBOX_URL, { headers: { "user-agent": "RCloud/0.12", "cache-control": "no-cache" } }); if (!response.ok) throw new Error(`HTTP_${response.status}`);
       const receipt = await runtime.processMailbox(await response.json()); const observation = { ok: true, status: "POLL_OK", attempt, started_at: startedAt, finished_at: new Date().toISOString(), request_id: receipt.request_id ?? null, receipt_status: receipt.status };
       await runtime.recordPoll(observation); return observation;
     } catch (error) { lastError = String(error); if (attempt < 3) await sleep(250 * (2 ** (attempt - 1))); }
@@ -127,7 +169,7 @@ async function pollMailbox(runtime) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url), runtime = env.RUNTIME_STATE.getByName("main");
-    if (url.pathname === "/health") return Response.json({ ok: true, service: "RCloud", version: "0.11.0", runtime: "cloudflare-worker+durable-object+alarm+cron+github-mailbox+workers-ai+request-ledger", control_plane: "github-main", ai_model: AI_MODEL, time: new Date().toISOString() });
+    if (url.pathname === "/health") return Response.json({ ok: true, service: "RCloud", version: "0.12.0", runtime: "cloudflare-worker+durable-object+alarm+cron+github-mailbox+workers-ai+request-ledger+stale-quarantine", control_plane: "github-main", ai_model: AI_MODEL, time: new Date().toISOString() });
     if (url.pathname === "/state") return Response.json({ ok: true, state: await runtime.getState() });
     if (url.pathname === "/loop/status") return Response.json({ ok: true, ...(await runtime.getLoopStatus()) });
     if (url.pathname === "/mailbox/status") return Response.json({ ok: true, ...(await runtime.getMailboxStatus()) });
