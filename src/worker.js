@@ -1,31 +1,31 @@
-import baseWorker, { RuntimeState } from "./index.js";
+import baseWorker, { RuntimeState as BaseRuntimeState } from "./index.js";
 import { drainQueue } from "./queue.js";
 
-// Extend the existing Durable Object class without changing its binding/class
-// identity, so deployed Durable Object storage remains intact across rollout.
-RuntimeState.prototype.getTerminalRequestIds = async function () {
-  const ledger = await this.getLedger();
-  return Object.entries(ledger)
-    .filter(([, entry]) => entry?.status && entry.status !== "PROCESSING")
-    .map(([requestId]) => requestId);
-};
+// Keep the exported/bound class name `RuntimeState` unchanged so the existing
+// Durable Object namespace and storage survive this rollout.
+export class RuntimeState extends BaseRuntimeState {
+  async getTerminalRequestIds() {
+    const ledger = await this.getLedger();
+    return Object.entries(ledger)
+      .filter(([, entry]) => entry?.status && entry.status !== "PROCESSING")
+      .map(([requestId]) => requestId);
+  }
 
-RuntimeState.prototype.recordQueuePoll = async function (observation) {
-  await this.ctx.storage.put("last_queue_poll", observation);
-  const history = (await this.ctx.storage.get("queue_poll_history")) ?? [];
-  history.push(observation);
-  while (history.length > 20) history.shift();
-  await this.ctx.storage.put("queue_poll_history", history);
-};
+  async recordQueuePoll(observation) {
+    await this.ctx.storage.put("last_queue_poll", observation);
+    const history = (await this.ctx.storage.get("queue_poll_history")) ?? [];
+    history.push(observation);
+    while (history.length > 20) history.shift();
+    await this.ctx.storage.put("queue_poll_history", history);
+  }
 
-RuntimeState.prototype.getQueueStatus = async function () {
-  return {
-    last_queue_poll: (await this.ctx.storage.get("last_queue_poll")) ?? null,
-    recent_queue_polls: (await this.ctx.storage.get("queue_poll_history")) ?? []
-  };
-};
-
-export { RuntimeState };
+  async getQueueStatus() {
+    return {
+      last_queue_poll: (await this.ctx.storage.get("last_queue_poll")) ?? null,
+      recent_queue_polls: (await this.ctx.storage.get("queue_poll_history")) ?? []
+    };
+  }
+}
 
 async function pollQueue(runtime) {
   const startedAt = new Date().toISOString();
@@ -57,7 +57,6 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    // Preserve the proven loop + legacy mailbox path during queue canaries.
     await baseWorker.scheduled(controller, env, ctx);
     const runtime = env.RUNTIME_STATE.getByName("main");
     ctx.waitUntil(pollQueue(runtime));
