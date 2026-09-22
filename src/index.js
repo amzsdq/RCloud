@@ -48,6 +48,7 @@ export class RuntimeState extends DurableObject {
     const safeSeconds = Math.max(5, Math.min(Number(seconds) || 120, 3600));
     const fireAt = Date.now() + safeSeconds * 1000;
 
+    await this.ctx.storage.put("autoboot_enabled", true);
     await this.ctx.storage.put("loop_config", {
       enabled: true,
       interval_seconds: safeSeconds
@@ -62,7 +63,8 @@ export class RuntimeState extends DurableObject {
       alarm_fire_at: new Date(fireAt).toISOString(),
       alarm_interval_seconds: safeSeconds,
       loop_enabled: true,
-      loop_count: 0
+      loop_count: 0,
+      autoboot_enabled: true
     };
 
     await this.ctx.storage.put("state", state);
@@ -73,7 +75,78 @@ export class RuntimeState extends DurableObject {
     };
   }
 
+  async ensureLoop(seconds = 120) {
+    const autoboot = await this.ctx.storage.get("autoboot_enabled");
+
+    if (autoboot === false) {
+      return {
+        ok: true,
+        action: "DISABLED",
+        reason: "AUTOBOOT_DISABLED"
+      };
+    }
+
+    const safeSeconds = Math.max(5, Math.min(Number(seconds) || 120, 3600));
+    const config =
+      (await this.ctx.storage.get("loop_config")) ?? {
+        enabled: false,
+        interval_seconds: safeSeconds
+      };
+    const alarmTime = await this.ctx.storage.getAlarm();
+    const count =
+      (await this.ctx.storage.get("loop_count")) ?? 0;
+
+    if (config.enabled && alarmTime != null) {
+      return {
+        ok: true,
+        action: "ALREADY_RUNNING",
+        loop_count: count,
+        alarm_time_ms: alarmTime,
+        alarm_fire_at: new Date(alarmTime).toISOString()
+      };
+    }
+
+    const interval =
+      config.enabled && config.interval_seconds
+        ? Number(config.interval_seconds)
+        : safeSeconds;
+
+    const fireAt = Date.now() + interval * 1000;
+
+    await this.ctx.storage.put("autoboot_enabled", true);
+    await this.ctx.storage.put("loop_config", {
+      enabled: true,
+      interval_seconds: interval
+    });
+    await this.ctx.storage.setAlarm(fireAt);
+
+    const previous =
+      (await this.ctx.storage.get("state")) ?? {};
+
+    const state = {
+      ...previous,
+      value: "LOOP_ARMED",
+      updated_at: new Date().toISOString(),
+      alarm_fire_at: new Date(fireAt).toISOString(),
+      alarm_interval_seconds: interval,
+      loop_enabled: true,
+      loop_count: count,
+      autoboot_enabled: true,
+      bootstrapped_by: "CLOUD_CRON"
+    };
+
+    await this.ctx.storage.put("state", state);
+
+    return {
+      ok: true,
+      action: "BOOTSTRAPPED",
+      state,
+      alarm_time_ms: fireAt
+    };
+  }
+
   async stopLoop() {
+    await this.ctx.storage.put("autoboot_enabled", false);
     await this.ctx.storage.put("loop_config", {
       enabled: false,
       interval_seconds: null
@@ -89,6 +162,7 @@ export class RuntimeState extends DurableObject {
       value: "LOOP_STOPPED",
       updated_at: new Date().toISOString(),
       loop_enabled: false,
+      autoboot_enabled: false,
       alarm_fire_at: null
     };
 
@@ -107,10 +181,13 @@ export class RuntimeState extends DurableObject {
     const alarmTime = await this.ctx.storage.getAlarm();
     const count =
       (await this.ctx.storage.get("loop_count")) ?? 0;
+    const autoboot =
+      (await this.ctx.storage.get("autoboot_enabled")) !== false;
 
     return {
       state,
       config,
+      autoboot_enabled: autoboot,
       loop_count: count,
       alarm_time_ms: alarmTime,
       alarm_fire_at:
@@ -187,8 +264,8 @@ export default {
       return Response.json({
         ok: true,
         service: "RCloud",
-        version: "0.4.0",
-        runtime: "cloudflare-worker+durable-object+self-rescheduling-alarm",
+        version: "0.4.1",
+        runtime: "cloudflare-worker+durable-object+self-rescheduling-alarm+cron-bootstrap",
         time: new Date().toISOString()
       });
     }
@@ -252,6 +329,16 @@ export default {
       });
     }
 
+    if (url.pathname === "/loop/ensure") {
+      const seconds = url.searchParams.get("seconds") ?? "120";
+      const result = await runtime.ensureLoop(seconds);
+
+      return Response.json({
+        ok: true,
+        ...result
+      });
+    }
+
     if (url.pathname === "/loop/stop") {
       const state = await runtime.stopLoop();
 
@@ -271,7 +358,7 @@ export default {
     }
 
     return new Response(
-      "RCloud is alive. Try /health, /state, /loop/start?seconds=120, /loop/status, or /loop/stop",
+      "RCloud is alive. Try /health, /state, /loop/status, or /loop/stop",
       {
         status: 200,
         headers: {
@@ -279,5 +366,10 @@ export default {
         }
       }
     );
+  },
+
+  async scheduled(controller, env, ctx) {
+    const runtime = env.RUNTIME_STATE.getByName("main");
+    ctx.waitUntil(runtime.ensureLoop(120));
   }
 };
