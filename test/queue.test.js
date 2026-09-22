@@ -10,9 +10,9 @@ test("queue index requires immutable path/request identity", () => {
 test("bounded drain skips terminal entries and processes unseen requests", async () => {
   const oldFetch = globalThis.fetch;
   const bodies = {
-    "A": { schema_version: 1, request_id: "A", action: "NOOP", payload: {} },
-    "B": { schema_version: 1, request_id: "B", action: "NOOP", payload: {} },
-    "C": { schema_version: 1, request_id: "C", action: "NOOP", payload: {} }
+    "A": { schema_version: 1, request_id: "A", target: "runtime:main", action: "NOOP", payload: {} },
+    "B": { schema_version: 1, request_id: "B", target: "runtime:main", action: "NOOP", payload: {} },
+    "C": { schema_version: 1, request_id: "C", target: "runtime:main", action: "NOOP", payload: {} }
   };
   globalThis.fetch = async url => {
     const u = String(url);
@@ -30,6 +30,20 @@ test("bounded drain skips terminal entries and processes unseen requests", async
     assert.deepEqual(executed, ["B"]);
     assert.equal(result.processed, 1);
     assert.equal(result.skipped_terminal, 1);
+  } finally {
+    globalThis.fetch = oldFetch;
+  }
+});
+
+test("queue rejects a command routed to another target", async () => {
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = async url => {
+    const u = String(url);
+    if (u.includes("queue-index.json")) return new Response(JSON.stringify({ schema_version: 1, requests: [{ request_id: "X", path: "control/requests/X.json" }] }));
+    return new Response(JSON.stringify({ schema_version: 1, request_id: "X", target: "runtime:other", action: "NOOP", payload: {} }));
+  };
+  try {
+    await assert.rejects(() => drainQueue({ isTerminal: async () => false, process: async () => ({ status: "COMPLETED" }) }), /QUEUE_TARGET_MISMATCH/);
   } finally {
     globalThis.fetch = oldFetch;
   }
