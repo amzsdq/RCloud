@@ -1,0 +1,102 @@
+name: runtime-evidence
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'wrangler.jsonc'
+      - 'control/mailbox.json'
+      - '.github/workflows/runtime-evidence.yml'
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rcloud-runtime-evidence
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Probe deployed read-only runtime
+        shell: bash
+        env:
+          BASE_URL: https://rcloud.amzsdq.workers.dev
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+
+          retry_get() {
+            local path="$1" out="$2"
+            for attempt in 1 2 3; do
+              if curl --fail --silent --show-error --connect-timeout 10 --max-time 20 \
+                -H 'cache-control: no-cache' "$BASE_URL$path" -o "$out"; then
+                return 0
+              fi
+              sleep $((attempt * 2))
+            done
+            return 1
+          }
+
+          retry_get /health evidence/health.json
+          retry_get /loop/status evidence/loop-status.json
+          retry_get /mailbox/status evidence/mailbox-status.json
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          health = json.loads(Path('evidence/health.json').read_text())
+          loop = json.loads(Path('evidence/loop-status.json').read_text())
+          mailbox = json.loads(Path('evidence/mailbox-status.json').read_text())
+
+          assert health.get('ok') is True, health
+          version = str(health.get('version', ''))
+          assert version, health
+
+          fires = loop.get('recent_alarm_fires') or []
+          loop_pass = bool(loop.get('verified_two_plus_fires')) and len(fires) >= 2
+
+          receipts = mailbox.get('recent_receipts') or []
+          receipt = mailbox.get('receipt')
+          if receipt:
+            receipts = receipts + [receipt]
+          ai_receipts = [r for r in receipts if r.get('request_id') == 'AI-CANARY-001']
+          ai_pass = any(
+              r.get('ok') is True
+              and r.get('action') == 'AI_PROMPT'
+              and 'RCLOUD_AI_ALIVE' in str((r.get('result') or {}).get('output', ''))
+              for r in ai_receipts
+          )
+
+          report = {
+              'runtime_reachable': True,
+              'version': version,
+              'loop_two_plus_pass': loop_pass,
+              'loop_fire_count_observed': len(fires),
+              'ai_canary_pass': ai_pass,
+              'ai_canary_receipts_observed': len(ai_receipts),
+              'ledger_size': mailbox.get('ledger_size'),
+              'last_poll': mailbox.get('last_poll'),
+          }
+          Path('evidence/summary.json').write_text(json.dumps(report, indent=2) + '\n')
+          print(json.dumps(report, indent=2))
+
+          # Reachability is the hard probe requirement. Feature canaries remain
+          # evidence fields rather than failing the workflow while rollout is pending.
+          PY
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-evidence-${{ github.run_id }}
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 7
