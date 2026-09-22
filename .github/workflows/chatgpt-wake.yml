@@ -1,0 +1,51 @@
+name: ChatGPT Wake Canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: Wake message to send
+        required: false
+        default: "1"
+        type: string
+      request_id:
+        description: Optional logical wake request ID
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rcloud-chatgpt-wake
+  cancel-in-progress: false
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    environment: chatgpt-wake
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Playwright library
+        run: npm install --no-save --no-package-lock --no-audit --no-fund playwright@1.55.0
+
+      - name: Send and verify ChatGPT wake
+        env:
+          CHATGPT_STORAGE_STATE_B64: ${{ secrets.CHATGPT_STORAGE_STATE_B64 }}
+          CHATGPT_WAKE_TARGET_URL: ${{ secrets.CHATGPT_WAKE_TARGET_URL }}
+          WAKE_MESSAGE: ${{ inputs.message }}
+          WAKE_REQUEST_ID: ${{ inputs.request_id || github.run_id }}
+        run: xvfb-run -a node scripts/wake-chatgpt.js
+
+      - name: Publish sanitized result
+        if: always()
+        shell: bash
+        run: |
+          if [ -f wake-result.json ]; then
+            jq '{ok,status,request_id,submitted,user_messages_before,user_messages_after,error}' wake-result.json >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '{"status":"RESULT_MISSING"}' >> "$GITHUB_STEP_SUMMARY"
+          fi
