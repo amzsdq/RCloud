@@ -2,8 +2,8 @@
   "schema_version": 1,
   "request_id": "LEDGER-CANARY-A",
   "action": "NOOP",
-  "issued_at": "2026-09-22T10:09:00Z",
+  "issued_at": "2026-09-22T10:15:00Z",
   "payload": {
-    "marker": "A-v1"
+    "marker": "A-v2-collision"
   }
 }
