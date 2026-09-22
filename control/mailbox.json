@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "request_id": "RCLOUD-IDLE-20260922T1018Z",
+  "request_id": "LEDGER-CANARY-A",
   "action": "NOOP",
-  "issued_at": "2026-09-22T10:18:00Z",
+  "issued_at": "2026-09-22T10:16:07Z",
   "payload": {
-    "purpose": "neutral mailbox after collision canary"
+    "marker": "A-v1"
   }
 }
