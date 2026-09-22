@@ -1,6 +1,7 @@
 const RAW_ROOT = "https://raw.githubusercontent.com/amzsdq/RCloud/main";
 export const QUEUE_INDEX_URL = `${RAW_ROOT}/control/queue-index.json`;
 export const QUEUE_BATCH_LIMIT = 5;
+export const QUEUE_TARGET = "runtime:main";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -41,12 +42,10 @@ export async function readQueueIndex() {
 export async function fetchQueuedCommand(item) {
   const command = await fetchJson(`${RAW_ROOT}/${item.path}`);
   if (!command || command.request_id !== item.request_id) throw new Error("QUEUE_BODY_ID_MISMATCH");
+  if (command.target !== QUEUE_TARGET) throw new Error("QUEUE_TARGET_MISMATCH");
   return command;
 }
 
-// `isTerminal(requestId)` and `process(command)` are injected so this transport
-// stays independent of Durable Object storage details. The caller must use the
-// existing durable ledger as the execution authority.
 export async function drainQueue({ isTerminal, process, limit = QUEUE_BATCH_LIMIT }) {
   const index = await readQueueIndex();
   const boundedLimit = Math.max(1, Math.min(Number(limit) || QUEUE_BATCH_LIMIT, 20));
@@ -66,12 +65,5 @@ export async function drainQueue({ isTerminal, process, limit = QUEUE_BATCH_LIMI
     processed += 1;
   }
 
-  return {
-    ok: true,
-    indexed: index.requests.length,
-    processed,
-    skipped_terminal: skippedTerminal,
-    batch_limit: boundedLimit,
-    results
-  };
+  return { ok: true, indexed: index.requests.length, processed, skipped_terminal: skippedTerminal, batch_limit: boundedLimit, results };
 }
