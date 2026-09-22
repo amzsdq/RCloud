@@ -66,7 +66,9 @@ Verified runtime evidence:
 Strict deployed canary now verified:
 - same-ID/different-fingerprint collision rejection: **PASS** — hardened runtime-evidence run `35714954029` required a post-`issued_at` poll for `LEDGER-CANARY-A`, detected that the retained ledger fingerprint differed from the current command fingerprint, and passed only after the deployed runtime reported `receipt_status=REJECTED` with a matching `REQUEST_ID_COLLISION` receipt.
 
-Still pending dedicated deployed canaries: non-consecutive `A → B → A` suppression under the same hardened predicate, stale `PROCESSING` quarantine, and forced mailbox-fetch retry/failure behavior. Earlier A/B workflow successes that matched only an already-retained request ID are not counted as proof; the probe now requires a post-`issued_at` poll plus the expected fingerprint/receipt transition.
+- non-consecutive `A → B → A` suppression: **PASS** — hardened runtime-evidence run `35715423144` observed deployed v0.12.2 and accepted the reissued original `LEDGER-CANARY-A/A-v1` only after the deployed poll reported `receipt_status=DUPLICATE` under the exact command-correlation predicate.
+
+Still pending dedicated deployed canaries: stale `PROCESSING` quarantine and forced mailbox-fetch retry/failure behavior. Earlier pre-hardening workflow successes that matched only an already-retained request ID are not counted as proof.
 
 ### Independent external probe
 
